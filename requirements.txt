@@ -1,4 +1,0 @@
-tabpfn-client
-pandas
-numpy
-scikit-learn
