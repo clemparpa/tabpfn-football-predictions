@@ -8,5 +8,6 @@ dependencies = [
     "tabpfn-client",
     "pandas",
     "numpy",
-    "scikit-learn"
+    "scikit-learn",
+    "mlflow>=3.14.0",
 ]
