@@ -22,8 +22,6 @@ Exemples (depuis la racine du repo) :
     python submit.py --run-id 5191988f39ec443cb55a07ea80c28084
 """
 import argparse
-import ast
-from dataclasses import fields
 from datetime import date, timedelta
 
 import numpy as np
@@ -32,16 +30,20 @@ import polars as pl
 from training.backtest import add_outcome, make_backtest_split
 from training.config import FeatureConfig
 from training.data import load_matches
+from training.ensemble import EnsembleConfig, build_model
 from training.features import build_features
+from training.mlflow_io import (
+    load_run_params,
+    reconstruct_ensemble_config,
+    reconstruct_from_params,
+)
 from training.model import (
     DEFAULT_MAX_TRAIN,
     FEATURE_GROUPS,
-    MLFLOW_TRACKING_URI,
     _feature_matrix,
     evaluate,
     train_classifier,
 )
-from training.tuning import build_tabpfn
 
 RANDOM_STATE = 42
 
@@ -66,86 +68,25 @@ WINNING_TABPFN_KWARGS = dict(n_estimators=8)
 PROBA_EPS = 1e-6
 
 
-# --- Reconstruction des hyperparamètres depuis MLflow ------------------------------------
+# --- Résolution de la config (MLflow ou constantes en dur) -------------------------------
 
-def _parse(value: str):
-    """Convertit une valeur de param MLflow (toujours str) en Python natif.
+def resolve_config(args) -> tuple[FeatureConfig, tuple[str, ...], EnsembleConfig, int, str]:
+    """Détermine la source des hyperparamètres (MLflow si flag, sinon constantes en dur).
 
-    `literal_eval` couvre ints/floats/bools/tuples/listes ; on retombe sur la chaîne brute
-    pour les valeurs non littérales (ex. `thinking_effort="medium"`).
+    Renvoie `(cfg_features, feature_columns, ensemble_cfg, train_years, source)`. L'`EnsembleConfig`
+    porte les kwargs TabPFN **et** la couche d'ensemble (`ensemble.*` si la run en contient).
     """
-    try:
-        return ast.literal_eval(value)
-    except (ValueError, SyntaxError):
-        return value
-
-
-def reconstruct_from_params(params: dict) -> tuple[FeatureConfig, tuple[str, ...], dict, int]:
-    """Reconstruit (cfg, feature_columns, tabpfn_kwargs, train_years) depuis les params MLflow.
-
-    Gère les deux schémas loggés : tuning (`cfg.*`/`tabpfn.*`) et backtest (champs `cfg` à plat,
-    sans `tabpfn.*`).
-    """
-    # FeatureConfig : pour chaque champ, on tente `cfg.<nom>` puis `<nom>` (schéma à plat).
-    cfg_kwargs = {}
-    for f in fields(FeatureConfig):
-        raw = params.get(f"cfg.{f.name}", params.get(f.name))
-        if raw is not None:
-            cfg_kwargs[f.name] = _parse(raw)
-    cfg = FeatureConfig(**cfg_kwargs)
-
-    if "feature_columns" not in params:
-        raise ValueError("Param `feature_columns` absent de la run MLflow : impossible de reconstruire les colonnes.")
-    feature_columns = tuple(_parse(params["feature_columns"]))
-
-    tabpfn_kwargs = {
-        k[len("tabpfn."):]: _parse(v) for k, v in params.items() if k.startswith("tabpfn.")
-    }
-
-    if "train_years" not in params:
-        raise ValueError("Param `train_years` absent de la run MLflow.")
-    train_years = int(_parse(params["train_years"]))
-
-    return cfg, feature_columns, tabpfn_kwargs, train_years
-
-
-def load_mlflow_params(run_id: str | None, experiment: str | None) -> tuple[dict, str, float | None]:
-    """Charge les params d'une run MLflow (par id, ou meilleure run d'un experiment par log-loss).
-
-    Renvoie `(params, run_id, log_loss)`.
-    """
-    from mlflow.tracking import MlflowClient
-
-    client = MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
-    if run_id:
-        run = client.get_run(run_id)
-    else:
-        assert experiment is not None  # garanti par resolve_config (run_id falsy => experiment set)
-        exp = client.get_experiment_by_name(experiment)
-        if exp is None:
-            raise ValueError(f"Experiment MLflow introuvable : {experiment!r}")
-        runs = client.search_runs(
-            [exp.experiment_id], order_by=["metrics.log_loss ASC"], max_results=1
-        )
-        if not runs:
-            raise ValueError(f"Aucune run dans l'experiment {experiment!r}")
-        run = runs[0]
-    return run.data.params, run.info.run_id, run.data.metrics.get("log_loss")
-
-
-def resolve_config(args) -> tuple[FeatureConfig, tuple[str, ...], dict, int, str]:
-    """Détermine la source des hyperparamètres (MLflow si flag, sinon constantes en dur)."""
     if args.run_id or args.experiment:
-        params, run_id, log_loss = load_mlflow_params(args.run_id, args.experiment)
+        params, run_id, log_loss = load_run_params(args.run_id, args.experiment)
         cfg, columns, tabpfn_kwargs, train_years = reconstruct_from_params(params)
+        ensemble_cfg = reconstruct_ensemble_config(params, tabpfn_kwargs)
         ll = f"{log_loss:.4f}" if log_loss is not None else "?"
         source = f"MLflow run {run_id} (log_loss={ll})"
     else:
-        cfg, columns, tabpfn_kwargs, train_years = (
-            WINNING_CFG, WINNING_COLUMNS, dict(WINNING_TABPFN_KWARGS), WINNING_TRAIN_YEARS
-        )
+        cfg, columns, train_years = WINNING_CFG, WINNING_COLUMNS, WINNING_TRAIN_YEARS
+        ensemble_cfg = EnsembleConfig(tabpfn_kwargs=dict(WINNING_TABPFN_KWARGS))
         source = "constantes en dur (WINNING_*)"
-    return cfg, columns, tabpfn_kwargs, train_years, source
+    return cfg, columns, ensemble_cfg, train_years, source
 
 
 def apply_tabpfn_overrides(kwargs: dict, *, n_estimators, thinking, thinking_effort) -> dict:
@@ -168,11 +109,11 @@ def apply_tabpfn_overrides(kwargs: dict, *, n_estimators, thinking, thinking_eff
 
 # --- Pipeline de soumission --------------------------------------------------------------
 
-def backtest_sanity_check(cfg, feature_columns, tabpfn_kwargs, train_years) -> None:
+def backtest_sanity_check(cfg, feature_columns, ensemble_cfg, train_years) -> None:
     """Réentraîne/évalue sur le cutoff 2025-01-01 pour valider le pipeline tuné."""
     split = make_backtest_split(date(2025, 1, 1), train_years, None, cfg)
     train = split.train.sort("date").tail(DEFAULT_MAX_TRAIN)
-    clf = build_tabpfn(tabpfn_kwargs, RANDOM_STATE)
+    clf = build_model(ensemble_cfg, RANDOM_STATE)
     clf = train_classifier(train, clf, RANDOM_STATE, feature_columns)
     metrics = evaluate(clf, split.test, feature_columns)
     print(
@@ -192,19 +133,29 @@ def main() -> None:
         help="force le mode thinking : --thinking l'active, --no-thinking le désactive (défaut : valeur de la source)",
     )
     parser.add_argument("--thinking-effort", choices=["medium", "high"], default="medium", help="effort du mode thinking (si activé)")
+    parser.add_argument("--no-gbm", action="store_true", help="désactive la couche GBM (TabPFN seul) même si la run l'active")
+    parser.add_argument("--weight", type=float, default=None, help="override du poids TabPFN dans l'ensemble (0..1)")
     parser.add_argument("--out", default=None, help="chemin du CSV de sortie (défaut : predictions_YYYYMMDD.csv)")
     parser.add_argument("--no-backtest", action="store_true", help="saute le backtest de contrôle")
     args = parser.parse_args()
 
-    cfg, feature_columns, tabpfn_kwargs, train_years, source = resolve_config(args)
-    tabpfn_kwargs = apply_tabpfn_overrides(
-        tabpfn_kwargs,
+    cfg, feature_columns, ensemble_cfg, train_years, source = resolve_config(args)
+    ensemble_cfg.tabpfn_kwargs = apply_tabpfn_overrides(
+        ensemble_cfg.tabpfn_kwargs,
         n_estimators=args.n_estimators,
         thinking=args.thinking,
         thinking_effort=args.thinking_effort,
     )
+    if args.no_gbm:
+        ensemble_cfg.use_gbm = False
+    if args.weight is not None:
+        ensemble_cfg.weight = args.weight
     print(f"Source des params : {source}")
-    print(f"train_years={train_years} | {len(feature_columns)} features | tabpfn={tabpfn_kwargs}")
+    print(f"train_years={train_years} | {len(feature_columns)} features | tabpfn={ensemble_cfg.tabpfn_kwargs}")
+    if ensemble_cfg.use_gbm:
+        print(f"Ensemble : GBM activé (combine={ensemble_cfg.combine}, weight={ensemble_cfg.weight:.3f}, gbm={ensemble_cfg.gbm_kwargs})")
+    else:
+        print("Ensemble : TabPFN seul (GBM désactivé)")
 
     res = load_matches()
     latest = res.filter(pl.col("finished")).get_column("date").max()
@@ -229,10 +180,10 @@ def main() -> None:
     print(f"Train : {train.height} matchs ({train_start} → {cutoff}) | fixtures : {future.height}")
 
     if not args.no_backtest:
-        backtest_sanity_check(cfg, feature_columns, tabpfn_kwargs, train_years)
+        backtest_sanity_check(cfg, feature_columns, ensemble_cfg, train_years)
 
     # Fit final + prédiction des fixtures.
-    clf = build_tabpfn(tabpfn_kwargs, RANDOM_STATE)
+    clf = build_model(ensemble_cfg, RANDOM_STATE)
     clf = train_classifier(train, clf, RANDOM_STATE, feature_columns)
     proba = clf.predict_proba(_feature_matrix(future, feature_columns))
 
