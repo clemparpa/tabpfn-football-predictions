@@ -23,6 +23,7 @@ from sklearn.metrics import accuracy_score, log_loss
 
 from training.backtest import make_backtest_split
 from training.config import FeatureConfig
+from training.evaluation import feature_matrix
 from training.features.team_form import _FEATURE_COLUMNS
 from training.proba import clip_renorm
 
@@ -72,9 +73,10 @@ def _feature_matrix(
     """Extrait la matrice de features (Float64 uniforme : `neutral`/ints/floats homogènes).
 
     `feature_columns` restreint les colonnes données au modèle (défaut : `FEATURE_COLUMNS`).
+    Délègue à `training.evaluation.feature_matrix` (implémentation canonique partagée).
     """
     columns = FEATURE_COLUMNS if feature_columns is None else feature_columns
-    return df.select(pl.col(c).cast(pl.Float64) for c in columns).to_numpy()
+    return feature_matrix(df, columns)
 
 
 def train_classifier(
