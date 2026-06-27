@@ -143,3 +143,52 @@ def test_rest_days_default_and_cap(make_res, default_cfg):
     assert rest[0] == default_cfg.default_rest
     assert rest[1] == 5
     assert rest[2] == default_cfg.rest_cap
+
+
+# --- report de la forme sur les matchs futurs -----------------------------------
+
+def test_future_match_carries_last_inclusive_form(make_res, default_cfg):
+    # France gagne 2 fois (3 pts each) puis a un fixture futur : il hérite de la forme
+    # INCLUANT le dernier match joué -> points_history = mean([3, 3]) = 3.0 (pas de shift).
+    res = make_res([
+        (date(2020, 1, 1), "France", "A", 2, 0),
+        (date(2020, 1, 2), "France", "B", 2, 0),
+        (date(2030, 1, 1), "France", "C", None, None),  # fixture futur
+    ])
+    wide = add_team_form(res, default_cfg).sort("match_id")
+    future = wide.filter(pl.col("match_id") == 2).row(0, named=True)
+    assert future["home_points_history"] == 3.0
+    assert future["home_winrate_history"] == 1.0
+    assert future["home_played"] == 2          # total des matchs joués (inclusive)
+    assert future["home_win_streak"] == 2      # série en cours, dernier match inclus
+
+
+def test_future_match_rest_from_last_played(make_res, default_cfg):
+    # rest d'un fixture = jours depuis le dernier match joué de l'équipe, plafonné
+    res = make_res([
+        (date(2020, 1, 1), "France", "A", 1, 0),
+        (date(2020, 1, 6), "France", "B", 1, 0),         # dernier match joué
+        (date(2020, 1, 9), "France", "C", None, None),   # +3 jours -> rest = 3
+        (date(2030, 1, 1), "France", "D", None, None),   # très loin -> plafonné
+    ])
+    wide = add_team_form(res, default_cfg).sort("match_id")
+    assert wide.filter(pl.col("match_id") == 2).get_column("home_rest").item() == 3
+    assert wide.filter(pl.col("match_id") == 3).get_column("home_rest").item() == default_cfg.rest_cap
+
+
+def test_future_match_cold_start_team_uses_defaults(make_res, default_cfg):
+    # une équipe qui n'apparaît que dans un fixture futur -> aucun historique -> défauts
+    res = make_res([
+        (date(2020, 1, 1), "France", "A", 1, 0),
+        (date(2030, 1, 1), "Nowhere", "Elsewhere", None, None),  # 2 équipes inconnues
+    ])
+    wide = add_team_form(res, default_cfg).sort("match_id")
+    row = wide.filter(pl.col("match_id") == 1).row(0, named=True)
+    for side in ("home", "away"):
+        assert row[f"{side}_points_history"] == default_cfg.default_points
+        assert row[f"{side}_winrate_history"] == default_cfg.default_rate
+        assert row[f"{side}_goal_diff_history"] == default_cfg.default_goal_diff
+        assert row[f"{side}_played"] == 0
+        assert row[f"{side}_rest"] == default_cfg.default_rest
+        assert row[f"{side}_win_streak"] == 0
+        assert row[f"{side}_draw_streak"] == 0

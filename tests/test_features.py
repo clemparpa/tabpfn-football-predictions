@@ -32,11 +32,45 @@ def test_expected_columns_present(wide):
     assert "goal_diff_history_diff" in wide.columns
 
 
-def test_future_matches_have_null_features(wide):
+def test_future_matches_carry_forward_form(wide):
+    # comme l'ELO/H2H, la forme est désormais reportée sur les fixtures futurs (jamais null)
     future = wide.filter(~pl.col("finished"))
     if future.height == 0:
         pytest.skip("aucun match non joué dans le jeu de données")
-    assert future.get_column("home_points_history").null_count() == future.height
+    for side in ("home", "away"):
+        assert future.get_column(f"{side}_points_history").null_count() == 0
+        assert future.get_column(f"{side}_played").null_count() == 0
+
+
+def test_future_form_reflects_only_prior_finished_matches(wide, real_matches):
+    # invariant anti-leak : pour un match futur, `played` doit égaler le nombre de matchs
+    # JOUÉS de l'équipe strictement AVANT le coup d'envoi (recalculé depuis les données
+    # brutes). Vérifie d'un coup le bon team ET l'absence de report d'un match postérieur.
+    future = wide.filter(~pl.col("finished")).select(
+        "match_id", "date", "home_team", "away_team", "home_played", "away_played"
+    )
+    if future.height == 0:
+        pytest.skip("aucun match non joué dans le jeu de données")
+
+    finished = real_matches.filter(pl.col("finished"))
+    appearances = pl.concat([
+        finished.select(pl.col("home_team").alias("team"), pl.col("date").alias("played_date")),
+        finished.select(pl.col("away_team").alias("team"), pl.col("date").alias("played_date")),
+    ])
+
+    for side in ("home", "away"):
+        expected = (
+            future.select("match_id", "date", team=pl.col(f"{side}_team"))
+            .join(appearances, on="team", how="left")
+            .filter(pl.col("played_date") < pl.col("date"))  # uniquement les matchs antérieurs
+            .group_by("match_id").len()
+        )
+        check = (
+            future.select("match_id", observed=pl.col(f"{side}_played"))
+            .join(expected, on="match_id", how="left")
+            .with_columns(pl.col("len").fill_null(0))  # équipe sans historique -> 0
+        )
+        assert check.filter(pl.col("observed") != pl.col("len")).height == 0
 
 
 def test_played_matches_have_non_null_features(wide):
