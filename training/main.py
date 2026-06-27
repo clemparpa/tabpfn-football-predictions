@@ -1,17 +1,24 @@
-"""Point d'entrée : charge les données et construit le frame de features.
+"""Point d'entrée : entraîne et évalue TabPFN sur un split de backtest.
 
-À ce stade le pipeline s'arrête à la construction des features. L'entraînement du modèle
-(et le log MLflow) seront ajoutés une fois l'ELO et le H2H en place.
+Construit le split (cutoff + années d'historique), entraîne le modèle, évalue sur le test et
+logge le run dans MLflow. Le 1er appel à `tabpfn_client` peut demander un token
+d'authentification.
 """
-from training.config import FeatureConfig
-from training.data import load_matches
-from training.features import build_features
+from datetime import date
+
+from training.model import run_backtest
+
+DEFAULT_CUTOFF = date(2022, 1, 1)
+DEFAULT_TRAIN_YEARS = 12
 
 
 def main():
-    res = load_matches()
-    wide = build_features(res, FeatureConfig())
-    print(wide)
+    result = run_backtest(DEFAULT_CUTOFF, DEFAULT_TRAIN_YEARS)
+    print(
+        f"cutoff={DEFAULT_CUTOFF} train_years={DEFAULT_TRAIN_YEARS} "
+        f"| train={result.n_train} test={result.n_test} "
+        f"| accuracy={result.accuracy:.4f} log_loss={result.log_loss:.4f}"
+    )
 
 
 if __name__ == "__main__":
