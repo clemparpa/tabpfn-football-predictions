@@ -5,3 +5,5 @@ __pycache__/
 .venv/
 .DS_Store
 .claude
+notebooks/__marimo__/
+notebooks/cache/
