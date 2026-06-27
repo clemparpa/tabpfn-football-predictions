@@ -36,12 +36,12 @@ from training.model import (
 OPTUNA_STORAGE = "sqlite:///optuna.db"
 DEFAULT_STUDY_NAME = "tabpfn-football"
 OPTUNA_EXPERIMENT = "tabpfn-football-optuna"  # expérience MLflow dédiée à la recherche
-TRAIN_YEARS_RANGE = (4, 8)
+TRAIN_YEARS_RANGE = (4, 10)
 
 # Dates de cutoff candidates (plus récente en tête) ; `default_cutoffs(n)` en prend les n
 # premières. Chaque cutoff masque tout match >= date et teste sur les matchs réellement joués.
 DEFAULT_CUTOFF_POOL: tuple[date, ...] = (
-    date(2026, 1, 1),
+    date(2026, 1, 2),
     date(2025, 1, 1),
 )
 

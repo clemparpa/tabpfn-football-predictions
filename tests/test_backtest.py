@@ -8,27 +8,7 @@ from datetime import date
 import polars as pl
 import pytest
 
-from training.backtest import add_outcome, make_backtest_split, mask_after
-
-
-# --- mask_after -----------------------------------------------------------------
-
-def test_mask_after_marks_future_unplayed(make_res):
-    res = make_res([
-        (date(2019, 1, 1), "A", "B", 2, 0),
-        (date(2021, 1, 1), "C", "D", 1, 1),  # >= cutoff -> masqué
-    ])
-    masked = mask_after(res, date(2020, 1, 1))
-
-    past = masked.filter(pl.col("match_id") == 0).row(0, named=True)
-    future = masked.filter(pl.col("match_id") == 1).row(0, named=True)
-
-    # match antérieur intact
-    assert past["finished"] is True
-    assert past["home_score"] == 2 and past["away_score"] == 0
-    # match >= cutoff masqué
-    assert future["finished"] is False
-    assert future["home_score"] is None and future["away_score"] is None
+from training.backtest import add_outcome, make_backtest_split
 
 
 # --- add_outcome ----------------------------------------------------------------
@@ -81,8 +61,8 @@ def test_test_set_is_played_from_cutoff(make_res):
     assert split.test.get_column("outcome").null_count() == 0
 
 
-def test_test_features_are_carried_forward(make_res):
-    # un match du test (masqué) doit recevoir la forme reportée, jamais null
+def test_test_features_are_populated(make_res):
+    # un match du test reçoit ses features de forme pré-match, jamais null
     res = make_res([
         (date(2020, 1, 1), "France", "A", 2, 0),
         (date(2022, 1, 1), "France", "B", 1, 0),
@@ -90,29 +70,31 @@ def test_test_features_are_carried_forward(make_res):
     split = make_backtest_split(date(2021, 1, 1), train_years=10, res=res)
     test_row = split.test.row(0, named=True)
     assert test_row["home_points_history"] is not None
-    assert test_row["home_played"] == 1  # 1 match joué avant le cutoff
+    assert test_row["home_played"] == 1  # 1 match joué avant ce match
 
 
-# --- pas de fuite : features gelées au cutoff -----------------------------------
+# --- rolling : la forme reflète les matchs intra-fenêtre (sans self-leak) -------
 
-def test_no_leak_form_frozen_at_cutoff(make_res):
-    # France gagne 2 fois avant le cutoff, puis 2 matchs APRÈS (tous deux dans le test).
-    # Les deux matchs du test doivent refléter UNIQUEMENT l'état pré-cutoff : le match de
-    # 2022 ne doit pas influencer celui de 2023 (sinon fuite temporelle).
+def test_rolling_form_reflects_intra_window(make_res):
+    # France gagne 2 fois avant le cutoff, PERD en 2022, puis rejoue en 2023.
+    # 2022 et 2023 sont tous deux dans le test : le match de 2023 DOIT voir le résultat de
+    # 2022 (rolling, comme la baseline), mais le match de 2022 ne doit PAS voir son propre
+    # résultat (pré-match strict).
     res = make_res([
-        (date(2020, 1, 1), "France", "A", 2, 0),
-        (date(2020, 6, 1), "France", "B", 2, 0),
-        (date(2022, 1, 1), "France", "C", 1, 0),
-        (date(2023, 1, 1), "France", "D", 3, 0),
+        (date(2020, 1, 1), "France", "A", 2, 0),  # victoire (3 pts)
+        (date(2020, 6, 1), "France", "B", 2, 0),  # victoire (3 pts)
+        (date(2022, 1, 1), "France", "C", 0, 1),  # défaite (0 pt) — match du test
+        (date(2023, 1, 1), "France", "D", 3, 0),  # match du test
     ])
     split = make_backtest_split(date(2021, 1, 1), train_years=10, res=res)
     test = split.test.sort("match_id")
 
     assert test.get_column("match_id").to_list() == [2, 3]
-    # played identique (2 matchs pré-cutoff) pour les deux -> le match de 2022 n'a pas compté
-    assert test.get_column("home_played").to_list() == [2, 2]
-    # forme inclusive figée : mean([3, 3]) = 3.0 pour les deux
-    assert test.get_column("home_points_history").to_list() == [3.0, 3.0]
+    # played : 2022 voit 2 matchs avant lui ; 2023 en voit 3 (le match de 2022 a compté)
+    assert test.get_column("home_played").to_list() == [2, 3]
+    # 2022 : pré-match strict = mean([3, 3]) = 3.0 (sa propre défaite n'y est pas)
+    # 2023 : la défaite de 2022 entre dans l'historique = mean([3, 3, 0]) = 2.0
+    assert test.get_column("home_points_history").to_list() == [3.0, 2.0]
 
 
 # --- filtre par catégorie : retrait complet du dataset --------------------------
@@ -159,25 +141,37 @@ def test_real_split_is_coherent(real_matches):
     assert (split.train.get_column("date") < cutoff).all()
     assert (split.test.get_column("date") >= cutoff).all()
 
-    # report de forme sur le test : aucune feature null
+    # features de forme du test : aucune null
     for side in ("home", "away"):
         assert split.test.get_column(f"{side}_points_history").null_count() == 0
         assert split.test.get_column(f"{side}_played").null_count() == 0
 
-    # invariant anti-fuite : `played` d'un match test = nb de matchs JOUÉS de l'équipe
-    # strictement AVANT le cutoff (recalculé depuis les données brutes).
-    finished_before = real_matches.filter(pl.col("finished") & (pl.col("date") < cutoff))
+    # invariant anti-fuite (rolling) : `played` d'un match du test = nb de matchs JOUÉS de
+    # l'équipe strictement AVANT ce match — ordre (date, match_id) — recalculé depuis le brut.
+    finished = real_matches.filter(pl.col("finished"))
     appearances = pl.concat([
-        finished_before.select(pl.col("home_team").alias("team")),
-        finished_before.select(pl.col("away_team").alias("team")),
+        finished.select(pl.col("home_team").alias("team"),
+                        pl.col("date").alias("adate"), pl.col("match_id").alias("amid")),
+        finished.select(pl.col("away_team").alias("team"),
+                        pl.col("date").alias("adate"), pl.col("match_id").alias("amid")),
     ])
-    counts = appearances.group_by("team").len()
 
     for side in ("home", "away"):
         check = (
-            split.test.select("match_id", observed=pl.col(f"{side}_played"),
-                              team=pl.col(f"{side}_team"))
-            .join(counts, on="team", how="left")
-            .with_columns(pl.col("len").fill_null(0))
+            split.test.select(
+                "match_id",
+                observed=pl.col(f"{side}_played"),
+                team=pl.col(f"{side}_team"),
+                mdate=pl.col("date"),
+            )
+            .join(appearances, on="team", how="left")
+            .with_columns(
+                prior=(
+                    (pl.col("adate") < pl.col("mdate"))
+                    | ((pl.col("adate") == pl.col("mdate")) & (pl.col("amid") < pl.col("match_id")))
+                ).fill_null(False).cast(pl.Int32)
+            )
+            .group_by("match_id", "observed")
+            .agg(recount=pl.col("prior").sum())
         )
-        assert check.filter(pl.col("observed") != pl.col("len")).height == 0
+        assert check.filter(pl.col("observed") != pl.col("recount")).height == 0

@@ -1,19 +1,22 @@
 """Découpage train/test pour le backtesting, sans fuite temporelle.
 
-L'idée : simuler une date « aujourd'hui » (`cutoff`). Tout match à partir de cette date est
-masqué (passé en « non joué »), de sorte que le pipeline de features le traite exactement
-comme un fixture à prédire — ELO/H2H/forme reportent la dernière valeur connue *avant* le
-cutoff, sans regarder l'avenir. On entraîne ensuite sur une fenêtre d'historique
-(`train_years` années avant le cutoff) et on teste sur les matchs réellement joués à partir
-du cutoff.
+L'idée : simuler une date « aujourd'hui » (`cutoff`). On entraîne sur une fenêtre
+d'historique (`train_years` années avant le cutoff) et on teste sur les matchs réellement
+joués à partir du cutoff.
+
+Les features sont calculées sur les données **réelles** (non masquées), exactement comme la
+baseline `predict.py` : chaque match du test reçoit donc l'état (ELO/forme/H2H) reflétant
+*tous* les matchs joués avant son coup d'envoi — y compris les autres matchs du test joués
+plus tôt dans la fenêtre. C'est l'évaluation « au fil de l'eau » (rolling), comparable 1:1
+au backtest de la baseline.
+
+Garantie anti-fuite : elle ne vient PAS d'un masquage, mais des feature builders eux-mêmes,
+qui calculent du strictement pré-match pour tout match `finished` (`team_form` via `shift(1)`,
+`elo` en enregistrant le rating avant mise à jour, `h2h` en retranchant la contribution
+propre du match). Un match joué n'utilise donc jamais son propre résultat ni un match futur.
 
 Le module ne fait que le découpage des données (features + label `outcome` + identifiants) :
 le choix et l'entraînement du modèle restent à l'appelant.
-
-Garantie anti-fuite : valable uniquement pour un découpage *chronologique* (tout `>= cutoff`
-masqué). Le report de forme de `team_form` lit le dernier match joué global de chaque équipe,
-qui est alors forcément antérieur au cutoff — donc sans fuite. Ne pas réutiliser pour un
-holdout dispersé.
 """
 from typing import Literal
 from collections.abc import Collection
@@ -52,20 +55,6 @@ class BacktestSplit:
     cutoff: date
     train_start: date
     categories: tuple[str, ...] | None
-
-
-def mask_after(res: pl.DataFrame, cutoff: date) -> pl.DataFrame:
-    """Passe en « non joué » tout match dont `date >= cutoff` (scores -> null, finished -> False).
-
-    Les matchs antérieurs au cutoff sont laissés intacts. C'est la primitive anti-fuite : un
-    match masqué devient un pur point de requête pour les features.
-    """
-    is_future = pl.col("date") >= cutoff
-    return res.with_columns(
-        home_score=pl.when(is_future).then(None).otherwise(pl.col("home_score")),
-        away_score=pl.when(is_future).then(None).otherwise(pl.col("away_score")),
-        finished=pl.col("finished") & ~is_future,
-    )
 
 
 def add_outcome(res: pl.DataFrame) -> pl.DataFrame:
@@ -119,9 +108,11 @@ def make_backtest_split(
     if categories is not None:
         res = res.filter(pl.col("tournament_category_label").is_in(list(categories)))
 
-    labels = add_outcome(res)  # vrais résultats, avant masquage
-    masked = mask_after(res, cutoff)
-    wide = build_features(masked, cfg).join(labels, on="match_id", how="left")
+    labels = add_outcome(res)
+    # features sur données réelles (non masquées) : chaque match du test reflète tous les
+    # matchs joués avant son coup d'envoi (rolling, cf. baseline). L'anti-fuite est portée
+    # par les feature builders (pré-match strict sur les matchs `finished`).
+    wide = build_features(res, cfg).join(labels, on="match_id", how="left")
 
     train_start = pl.select(pl.lit(cutoff).dt.offset_by(f"-{train_years}y")).item()
     played = pl.col("outcome").is_not_null()  # un match réellement joué (label disponible)
