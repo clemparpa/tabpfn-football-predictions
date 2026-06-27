@@ -14,7 +14,7 @@ La meilleure config est loggée dans MLflow comme une run **autonome** : on reco
 que `submit.py --run-id <run ensemble>` peut tout reconstruire depuis cette seule run.
 
 Exemple (depuis la racine du repo) :
-    python tune_ensemble.py --source-run-id <run source> --n-cutoffs 1 --n-trials 50
+    python -m cli.tune_ensemble --source-run-id <run source> --n-cutoffs 1 --n-trials 50
 """
 import argparse
 from datetime import date

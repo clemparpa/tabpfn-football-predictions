@@ -42,9 +42,9 @@ un tournoi neutre où `home_team`/`away_team` n'est qu'un ordre nominal.
 et `submit.py` se branchent, au lieu de réimplémenter chacun le fenêtrage du backtest.
 
 **Contexte** : le cœur `training/` (data → features → backtest → model → tuning) est propre et testé.
-Le « pas carré » est aux **bords** : (a) deux pipelines pandas legacy ([predict.py](../predict.py),
-[baseline.py](../baseline.py)) qui dupliquent tout le feature engineering ; (b) le fenêtrage train/test
-réimplémenté à la main dans [submit.py](../submit.py#L168-L178) au lieu d'appeler `make_backtest_split` ;
+Le « pas carré » est aux **bords** : (a) deux pipelines pandas legacy ([predict.py](../legacy/predict.py),
+[baseline.py](../legacy/baseline.py)) qui dupliquent tout le feature engineering ; (b) le fenêtrage train/test
+réimplémenté à la main dans [submit.py](../cli/submit.py) au lieu d'appeler `make_backtest_split` ;
 (c) le post-traitement des probas (clip/renorm/alignement classes) éparpillé entre `ensemble._clip_renorm`,
 `submit.py` et `model.evaluate`, plus le bricolage du notebook. Cette couture corrige aussi le **piège n°1**
 (features sur tout, filtre des lignes seulement).
@@ -53,7 +53,7 @@ réimplémenté à la main dans [submit.py](../submit.py#L168-L178) au lieu d'ap
 
 - **C1 — `training/proba.py` (unifier le post-traitement).** Extraire `clip_renorm(proba, eps)` (et
   l'alignement de colonnes sur `classes_`), aujourd'hui dupliqués dans `ensemble._clip_renorm`,
-  [submit.py:191-192](../submit.py#L191-L192) et la renorm de `model.evaluate`. Tous les appelants l'importent.
+  [submit.py](../cli/submit.py) et la renorm de `model.evaluate`. Tous les appelants l'importent.
   *Acceptation* : un seul point de vérité pour les probas ; tests existants inchangés et verts.
 - **C2 — `training/evaluation.py` (la couture = ex-S2).** `build_eval_frame(cfg, res=None)` (features sur
   **tout**, une fois) ; `select_rows(wide, *, train_pred, test_pred)` (filtre **lignes**, pas features) ;
@@ -184,7 +184,7 @@ coûteux et mieux calibré/sharp, sans contrainte de quota.
 
 **Périmètre / tâches**
 - Balayer `n_estimators` (8 / 16 / 32) et `thinking_mode` (+`thinking_effort`) — overrides déjà présents
-  dans [submit.py](../submit.py) — et mesurer sur S1.
+  dans [submit.py](../cli/submit.py) — et mesurer sur S1.
 - Choisir la config soumission qui minimise le log-loss LOTO.
 
 **Critères d'acceptation**

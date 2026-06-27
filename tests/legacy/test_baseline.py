@@ -9,7 +9,7 @@ from datetime import date
 
 import pandas as pd
 
-import baseline
+from legacy import baseline
 from training.backtest import make_backtest_split
 
 CUTOFF = date(2018, 1, 1)

@@ -1,6 +1,8 @@
 # TabPFN Football Predictions
 
-This repository is a template to participate in Prior Labs' [World Cup Game Outcome Prediction competition](https://ux.priorlabs.ai/worldcup). It has a basic script that outputs predictions with a standard prediction template. Use this template to generate predictions. The `predict.py` script should only be a source of inspiration, feel free to fork the repo and add your own ideas.
+This repository is a template to participate in Prior Labs' [World Cup Game Outcome Prediction competition](https://ux.priorlabs.ai/worldcup). It has a basic script that outputs predictions with a standard prediction template. Use this template to generate predictions. The `legacy/predict.py` script should only be a source of inspiration, feel free to fork the repo and add your own ideas.
+
+> **Note** : ce dépôt a évolué. Le pipeline maintenu vit dans le package `training/` ; la soumission se génère via `python -m cli.submit`. Les scripts pandas d'origine (`predict.py`, `baseline.py`) sont conservés dans `legacy/` comme références historiques (non maintenues). La section ci-dessous décrit le script `legacy/predict.py` d'origine.
 
 The script predicts international football match outcomes using [TabPFN](https://github.com/PriorLabs/TabPFN) using the [client repository](https://github.com/PriorLabs/tabpfn-client). It achieves ~59% accuracy and ~0.86 log-loss on held-out data. There is a good margin of progression. We look forward to your submission!
 
@@ -17,7 +19,7 @@ pip install -r requirements.txt
 ## Run
 
 ```bash
-python predict.py
+python legacy/predict.py
 ```
 
 This will:
@@ -31,7 +33,7 @@ This will:
 To refresh the dataset from source before predicting:
 
 ```bash
-python predict.py --refresh
+python legacy/predict.py --refresh
 ```
 
 ## Output
