@@ -23,7 +23,7 @@ from sklearn.metrics import accuracy_score, log_loss
 
 from training.backtest import make_backtest_split
 from training.config import FeatureConfig
-from training.evaluation import feature_matrix
+from training.evaluation import feature_matrix, predict_proba_frame, score
 from training.features.team_form import _FEATURE_COLUMNS
 from training.proba import clip_renorm
 
@@ -187,7 +187,7 @@ def run_backtest(
         train = train.sort("date").tail(max_train)  # garder les plus récents
 
     fitted = train_classifier(train, classifier, random_state, columns)
-    metrics = evaluate(fitted, split.test, columns)
+    metrics = score(predict_proba_frame(fitted, split.test, columns))
 
     if log_mlflow:
         _log_to_mlflow(

@@ -40,6 +40,7 @@ def _():
     import polars as pl
 
     from training.backtest import make_backtest_split
+    from training.evaluation import predict_proba_frame
     from training.model import DEFAULT_MAX_TRAIN, _feature_matrix
     from training.mlflow_io import load_run_params, reconstruct_from_params
     from training.tuning import build_tabpfn
@@ -58,8 +59,8 @@ def _():
         load_run_params,
         make_backtest_split,
         mo,
-        np,
         pl,
+        predict_proba_frame,
         reconstruct_from_params,
     )
 
@@ -101,10 +102,10 @@ def _(
     train_df = split.train.sort("date").tail(DEFAULT_MAX_TRAIN)
     test_df = split.test
 
-
+    # Matrice d'entraînement uniquement : la prédiction du test passe par `predict_proba_frame`
+    # (qui construit sa matrice depuis `test_df` + `feature_columns`).
     Xtr = _feature_matrix(train_df, feature_columns)
     ytr = train_df.get_column("outcome").to_numpy()
-    Xte = _feature_matrix(test_df, feature_columns)
 
     split_view = mo.md(
         f"## Backtest au cutoff `{CUTOFF}`\n\n"
@@ -112,7 +113,7 @@ def _(
         f"- **test** : {test_df.height} matchs (≥ `{CUTOFF}`)"
     )
     split_view
-    return Xte, Xtr, test_df, ytr
+    return Xtr, test_df, ytr
 
 
 @app.cell(hide_code=True)
@@ -135,15 +136,14 @@ def _(fit_button):
 
 @app.cell(hide_code=True)
 def _(
-    CLASSES,
-    Xte,
     Xtr,
     build_tabpfn,
     cache_path,
+    feature_columns,
     fit_button,
     mo,
-    np,
     pl,
+    predict_proba_frame,
     tabpfn_kwargs,
     test_df,
     ytr,
@@ -157,22 +157,14 @@ def _(
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         _clf = build_tabpfn(tabpfn_kwargs, 42)
         _clf.fit(Xtr, ytr)
-        _proba = np.asarray(_clf.predict_proba(Xte), dtype=float)
-        _order = [list(_clf.classes_).index(c) for c in CLASSES]
-        _proba = _proba[:, _order]
-        (
-            test_df.select(
-                "match_id", "date", "home_team", "away_team", "country", "neutral",
-                "tournament_category_label", "outcome",
-                "elo_diff", "points_history_diff", "h2h_n", "home_played", "away_played",
-            )
-            .with_columns(
-                p_away_win=pl.Series(_proba[:, 0]),
-                p_draw=pl.Series(_proba[:, 1]),
-                p_home_win=pl.Series(_proba[:, 2]),
-            )
-            .write_parquet(cache_path)
+        # Probas alignées (ordre canonique) + valides via la couture ; on joint ensuite les
+        # colonnes de segmentation du test (non données au modèle) pour l'analyse.
+        _pred = predict_proba_frame(_clf, test_df, feature_columns)
+        _extra = test_df.select(
+            "match_id", "country", "neutral", "tournament_category_label",
+            "elo_diff", "points_history_diff", "h2h_n", "home_played", "away_played",
         )
+        _pred.join(_extra, on="match_id").write_parquet(cache_path)
 
     preds = pl.read_parquet(cache_path)
     preds
