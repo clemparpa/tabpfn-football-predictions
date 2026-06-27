@@ -27,7 +27,9 @@ import polars as pl
 
 from training.config import FeatureConfig
 from training.data import TOURNAMENT_CATEGORY_LABELS, load_matches
-from training.features import build_features
+from training.evaluation import add_outcome, build_eval_frame, select_rows
+
+__all__ = ["BacktestSplit", "add_outcome", "make_backtest_split"]
 
 type TournamentCategory = Literal[
     "world",
@@ -57,22 +59,6 @@ class BacktestSplit:
     categories: tuple[str, ...] | None
 
 
-def add_outcome(res: pl.DataFrame) -> pl.DataFrame:
-    """Calcule le label `[match_id, outcome]` sur les matchs joués (scores d'origine).
-
-    `home_win` / `away_win` / `draw` — miroir polars du `np.select` de `predict.py`. Les
-    matchs non joués sont absents du frame renvoyé (donc `outcome` null après un left join).
-    """
-    return res.filter(pl.col("finished")).select(
-        "match_id",
-        outcome=pl.when(pl.col("home_score") > pl.col("away_score"))
-        .then(pl.lit("home_win"))
-        .when(pl.col("home_score") < pl.col("away_score"))
-        .then(pl.lit("away_win"))
-        .otherwise(pl.lit("draw")),
-    )
-
-
 def _validate_categories(categories: Collection[TournamentCategory] | None) -> tuple[TournamentCategory, ...] | None:
     """Vérifie que les labels demandés existent ; renvoie un tuple figé (ou None)."""
     if categories is None:
@@ -98,9 +84,15 @@ def make_backtest_split(
 
     - `cutoff` : tout match `>= cutoff` est masqué (= « futur » à prédire).
     - `train_years` : profondeur d'historique pour l'entraînement, `[cutoff - train_years, cutoff)`.
-    - `categories` : labels de catégorie de tournoi à *conserver* (None = toutes). Les autres
-      sont retirées du dataset **avant** le calcul des features (n'alimentent pas l'historique).
+    - `categories` : labels de catégorie de tournoi à *conserver* (None = toutes). ⚠️ Filtre **amont** :
+      les autres sont retirées du dataset **avant** le calcul des features (n'alimentent pas
+      l'historique). Pour restreindre seulement les *lignes* évaluées sans toucher aux features,
+      passer par la couture `training.evaluation` (`build_eval_frame` + `select_rows`).
     - `res` : frame injectable (défaut `load_matches()`), pratique pour les tests.
+
+    Mince wrapper au-dessus de la couture `training.evaluation` : `build_eval_frame` calcule les
+    features sur tout le dataset (rolling, anti-fuite portée par les builders), `select_rows`
+    découpe les fenêtres train/test.
     """
     categories = _validate_categories(categories)
     if res is None:
@@ -108,18 +100,15 @@ def make_backtest_split(
     if categories is not None:
         res = res.filter(pl.col("tournament_category_label").is_in(list(categories)))
 
-    labels = add_outcome(res)
-    # features sur données réelles (non masquées) : chaque match du test reflète tous les
-    # matchs joués avant son coup d'envoi (rolling, cf. baseline). L'anti-fuite est portée
-    # par les feature builders (pré-match strict sur les matchs `finished`).
-    wide = build_features(res, cfg).join(labels, on="match_id", how="left")
+    wide = build_eval_frame(cfg, res)
 
     train_start = pl.select(pl.lit(cutoff).dt.offset_by(f"-{train_years}y")).item()
     played = pl.col("outcome").is_not_null()  # un match réellement joué (label disponible)
-    train = wide.filter(
-        (pl.col("date") >= train_start) & (pl.col("date") < cutoff) & played
+    train, test = select_rows(
+        wide,
+        train_pred=(pl.col("date") >= train_start) & (pl.col("date") < cutoff) & played,
+        test_pred=(pl.col("date") >= cutoff) & played,
     )
-    test = wide.filter((pl.col("date") >= cutoff) & played)
 
     return BacktestSplit(
         train=train,

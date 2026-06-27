@@ -22,7 +22,6 @@ import numpy as np
 import polars as pl
 from sklearn.metrics import accuracy_score, log_loss
 
-from training.backtest import add_outcome
 from training.config import FeatureConfig
 from training.data import load_matches
 from training.features import build_features
@@ -39,6 +38,22 @@ _META_COLUMNS: tuple[str, ...] = ("match_id", "date", "home_team", "away_team", 
 def feature_matrix(df: pl.DataFrame, columns: Sequence[str]) -> np.ndarray:
     """Matrice de features (Float64 uniforme) restreinte à `columns`, dans l'ordre donné."""
     return df.select(pl.col(c).cast(pl.Float64) for c in columns).to_numpy()
+
+
+def add_outcome(res: pl.DataFrame) -> pl.DataFrame:
+    """Calcule le label `[match_id, outcome]` sur les matchs joués (scores d'origine).
+
+    `home_win` / `away_win` / `draw` — miroir polars du `np.select` de `predict.py`. Les
+    matchs non joués sont absents du frame renvoyé (donc `outcome` null après un left join).
+    """
+    return res.filter(pl.col("finished")).select(
+        "match_id",
+        outcome=pl.when(pl.col("home_score") > pl.col("away_score"))
+        .then(pl.lit("home_win"))
+        .when(pl.col("home_score") < pl.col("away_score"))
+        .then(pl.lit("away_win"))
+        .otherwise(pl.lit("draw")),
+    )
 
 
 def build_eval_frame(
