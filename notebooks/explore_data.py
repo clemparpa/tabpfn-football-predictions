@@ -25,6 +25,12 @@ def _(pl):
 
 
 @app.cell
+def _(results):
+    results
+    return
+
+
+@app.cell
 def _(pl, tournois_importance_path):
     def load_tournament_importance():        
         return pl.read_csv(tournois_importance_path).with_columns(
