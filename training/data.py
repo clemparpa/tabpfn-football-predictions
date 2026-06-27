@@ -9,6 +9,18 @@ import polars as pl
 
 from training.config import RESULTS_PATH, TOURNAMENT_IMPORTANCE_PATH
 
+# Labels de catégorie de tournoi, indexés par `tournament_category - 1` (1..7).
+# Source de vérité partagée (filtre du backtest, fixtures de test).
+TOURNAMENT_CATEGORY_LABELS = (
+    "world",
+    "continental_major",
+    "qualification_and_nations_leagues",
+    "regional",
+    "minor",
+    "non_fifa",
+    "really_minor",
+)
+
 
 def load_tournament_importance() -> pl.DataFrame:
     """Charge la table d'importance des tournois (catégorie -> label + rang 1..7)."""

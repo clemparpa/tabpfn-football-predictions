@@ -5,7 +5,7 @@ import polars as pl
 import pytest
 
 from training.config import FeatureConfig
-from training.data import load_matches
+from training.data import TOURNAMENT_CATEGORY_LABELS, load_matches
 
 
 @pytest.fixture(scope="session")
@@ -25,8 +25,9 @@ def make_res():
 
     `matches` est une liste de tuples (date, home_team, away_team, home_score, away_score).
     Un score à None marque un match non joué (finished == False). `match_id` est ajouté
-    dans l'ordre de la liste. `neutral` et `tournament_category` (requis par l'ELO) sont
-    ajoutés en colonnes constantes — surchargeables par match via `.with_columns(...)`.
+    dans l'ordre de la liste. `neutral`, `tournament_category` (requis par l'ELO) et
+    `tournament_category_label` (déduit de la catégorie) sont ajoutés en colonnes constantes
+    — surchargeables par match via `.with_columns(...)`.
     """
 
     def _make(
@@ -49,6 +50,9 @@ def make_res():
                 .alias("finished"),
                 neutral=pl.lit(neutral),
                 tournament_category=pl.lit(tournament_category, dtype=pl.Int64),
+                tournament_category_label=pl.lit(
+                    TOURNAMENT_CATEGORY_LABELS[tournament_category - 1]
+                ),
             )
             .with_row_index("match_id")
         )
