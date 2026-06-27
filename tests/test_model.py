@@ -39,6 +39,37 @@ def test_feature_columns_present_and_numeric(real_split):
     assert not np.isnan(matrix).any()  # report de forme sur le test -> aucun NaN
 
 
+def test_feature_columns_subset_restricts_matrix(real_split):
+    # `feature_columns` réduit la matrice aux colonnes demandées, dans l'ordre donné.
+    subset = ("home_elo", "away_elo", "elo_diff")
+    matrix = _feature_matrix(real_split.test, subset)
+    assert matrix.shape == (real_split.test.height, len(subset))
+
+
+def test_run_backtest_respects_feature_columns(real_split):
+    # Le sous-ensemble passé à run_backtest est bien celui vu par le classifieur à fit.
+    subset = ("home_elo", "away_elo", "elo_diff")
+
+    class _ColCountSpy:
+        classes_ = np.array(["away_win", "draw", "home_win"])
+
+        def fit(self, X, y):
+            self.n_features_seen = X.shape[1]
+            return self
+
+        def predict(self, X):
+            return np.array(["home_win"] * len(X))
+
+        def predict_proba(self, X):
+            return np.tile([1 / 3, 1 / 3, 1 / 3], (len(X), 1))
+
+    spy = _ColCountSpy()
+    run_backtest(
+        CUTOFF, train_years=4, classifier=spy, log_mlflow=False, feature_columns=subset
+    )
+    assert spy.n_features_seen == len(subset)
+
+
 def test_neutral_is_numeric(make_res):
     res = make_res(
         [

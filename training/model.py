@@ -13,6 +13,7 @@ Référence : `predict.py` (pandas, isolé) — labels `home_win`/`away_win`/`dr
 quotas requis, d'où le plafond `max_train`). Les tests injectent un faux classifieur pour
 rester hors-ligne ; seul un appel manuel touche le réseau.
 """
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import date
 
@@ -24,14 +25,27 @@ from training.backtest import make_backtest_split
 from training.config import FeatureConfig
 from training.features.team_form import _FEATURE_COLUMNS
 
-# Colonnes données au modèle : toute la forme par équipe + ELO + H2H + diffs + contexte.
-# Dérivé de `_FEATURE_COLUMNS` (source de vérité partagée) pour rester aligné sur le pipeline.
-FEATURE_COLUMNS: tuple[str, ...] = (
-    *(f"{side}_{col}" for col in _FEATURE_COLUMNS for side in ("home", "away")),
-    "home_elo", "away_elo",
-    "h2h_n", "h2h_home_winrate", "h2h_draw_rate", "h2h_gd",
-    "points_history_diff", "goal_diff_history_diff", "elo_diff",
-    "neutral",
+# Colonnes données au modèle, regroupées par famille de features. Ces groupes sont les leviers
+# de sélection de colonnes pour Optuna (toggles par groupe, cf. `training.tuning`).
+#   team_form : toute la forme par équipe (home/away pour chaque colonne de `_FEATURE_COLUMNS`)
+#   elo       : ratings ELO bruts
+#   h2h       : bilan tête-à-tête pré-match
+#   diffs     : écarts dérivés (points / goal diff / ELO ajusté de l'avantage terrain)
+#   context   : contexte du match (terrain neutre)
+FEATURE_GROUPS: dict[str, tuple[str, ...]] = {
+    "team_form": tuple(
+        f"{side}_{col}" for col in _FEATURE_COLUMNS for side in ("home", "away")
+    ),
+    "elo": ("home_elo", "away_elo"),
+    "h2h": ("h2h_n", "h2h_home_winrate", "h2h_draw_rate", "h2h_gd"),
+    "diffs": ("points_history_diff", "goal_diff_history_diff", "elo_diff"),
+    "context": ("neutral",),
+}
+
+# Ensemble complet des colonnes (toutes familles), dans l'ordre de `FEATURE_GROUPS`.
+# Préserve à l'identique l'ancienne définition pour ne pas casser le pipeline ni les tests.
+FEATURE_COLUMNS: tuple[str, ...] = tuple(
+    col for cols in FEATURE_GROUPS.values() for col in cols
 )
 
 MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"  # même store que mlflow-ui.sh
@@ -51,18 +65,28 @@ class BacktestResult:
     classes: tuple[str, ...]
 
 
-def _feature_matrix(df: pl.DataFrame) -> np.ndarray:
-    """Extrait la matrice de features (Float64 uniforme : `neutral`/ints/floats homogènes)."""
-    return df.select(pl.col(c).cast(pl.Float64) for c in FEATURE_COLUMNS).to_numpy()
+def _feature_matrix(
+    df: pl.DataFrame, feature_columns: Sequence[str] | None = None
+) -> np.ndarray:
+    """Extrait la matrice de features (Float64 uniforme : `neutral`/ints/floats homogènes).
+
+    `feature_columns` restreint les colonnes données au modèle (défaut : `FEATURE_COLUMNS`).
+    """
+    columns = FEATURE_COLUMNS if feature_columns is None else feature_columns
+    return df.select(pl.col(c).cast(pl.Float64) for c in columns).to_numpy()
 
 
 def train_classifier(
-    train_df: pl.DataFrame, classifier=None, random_state: int = 42
+    train_df: pl.DataFrame,
+    classifier=None,
+    random_state: int = 42,
+    feature_columns: Sequence[str] | None = None,
 ):
     """Entraîne un classifieur sur `train_df` (features + label `outcome`).
 
     `classifier` injectable (défaut : `TabPFNClassifier`) — permet de tester l'orchestration
     avec un faux modèle, sans appeler l'API distante.
+    `feature_columns` restreint les colonnes utilisées (défaut : `FEATURE_COLUMNS`).
     """
     if classifier is None:
         from tabpfn_client import TabPFNClassifier
@@ -70,13 +94,18 @@ def train_classifier(
         classifier = TabPFNClassifier(
             ignore_pretraining_limits=True, random_state=random_state
         )
-    classifier.fit(_feature_matrix(train_df), train_df.get_column("outcome").to_numpy())
+    classifier.fit(
+        _feature_matrix(train_df, feature_columns),
+        train_df.get_column("outcome").to_numpy(),
+    )
     return classifier
 
 
-def evaluate(classifier, test_df: pl.DataFrame) -> dict:
+def evaluate(
+    classifier, test_df: pl.DataFrame, feature_columns: Sequence[str] | None = None
+) -> dict:
     """Prédit sur `test_df` et renvoie accuracy / log-loss / taille du test."""
-    features = _feature_matrix(test_df)
+    features = _feature_matrix(test_df, feature_columns)
     truth = test_df.get_column("outcome").to_numpy()
     proba = classifier.predict_proba(features)
     return {
@@ -98,6 +127,7 @@ def _log_to_mlflow(
     random_state: int,
     max_train,
     experiment: str,
+    feature_columns: Sequence[str],
 ) -> None:
     import mlflow
 
@@ -113,6 +143,8 @@ def _log_to_mlflow(
             n_test=metrics["n_test"],
             random_state=random_state,
             max_train=str(max_train),
+            feature_columns=str(list(feature_columns)),
+            n_features=len(feature_columns),
         )
         mlflow.log_params(params)
         mlflow.log_metrics(
@@ -131,27 +163,30 @@ def run_backtest(
     classifier=None,
     log_mlflow: bool = True,
     experiment: str = DEFAULT_EXPERIMENT,
+    feature_columns: Sequence[str] | None = None,
 ) -> BacktestResult:
     """Construit le split, entraîne, évalue, et (option) logge le run dans MLflow.
 
     `max_train` plafonne l'entraînement aux lignes les plus récentes (limite de l'API TabPFN).
     `classifier` injectable et `log_mlflow=False` permettent des tests hors-ligne.
+    `feature_columns` restreint les colonnes données au modèle (défaut : `FEATURE_COLUMNS`).
     """
+    columns = FEATURE_COLUMNS if feature_columns is None else tuple(feature_columns)
     split = make_backtest_split(cutoff, train_years, categories, cfg)
 
     train = split.train
     if max_train is not None and train.height > max_train:
         train = train.sort("date").tail(max_train)  # garder les plus récents
 
-    fitted = train_classifier(train, classifier, random_state)
-    metrics = evaluate(fitted, split.test)
+    fitted = train_classifier(train, classifier, random_state, columns)
+    metrics = evaluate(fitted, split.test, columns)
 
     if log_mlflow:
         _log_to_mlflow(
             cfg, metrics,
             cutoff=cutoff, train_years=train_years, categories=split.categories,
             n_train=train.height, random_state=random_state, max_train=max_train,
-            experiment=experiment,
+            experiment=f"{experiment}-{cutoff}", feature_columns=columns,
         )
 
     return BacktestResult(
