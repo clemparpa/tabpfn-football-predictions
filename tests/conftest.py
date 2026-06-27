@@ -25,10 +25,13 @@ def make_res():
 
     `matches` est une liste de tuples (date, home_team, away_team, home_score, away_score).
     Un score à None marque un match non joué (finished == False). `match_id` est ajouté
-    dans l'ordre de la liste.
+    dans l'ordre de la liste. `neutral` et `tournament_category` (requis par l'ELO) sont
+    ajoutés en colonnes constantes — surchargeables par match via `.with_columns(...)`.
     """
 
-    def _make(matches: list[tuple]) -> pl.DataFrame:
+    def _make(
+        matches: list[tuple], neutral: bool = False, tournament_category: int = 4
+    ) -> pl.DataFrame:
         return (
             pl.DataFrame(
                 matches,
@@ -43,7 +46,9 @@ def make_res():
             )
             .with_columns(
                 (pl.col("home_score").is_not_null() & pl.col("away_score").is_not_null())
-                .alias("finished")
+                .alias("finished"),
+                neutral=pl.lit(neutral),
+                tournament_category=pl.lit(tournament_category, dtype=pl.Int64),
             )
             .with_row_index("match_id")
         )

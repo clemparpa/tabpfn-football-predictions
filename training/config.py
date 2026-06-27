@@ -39,3 +39,22 @@ class FeatureConfig:
     victory_points: int = 3
     draw_points: int = 1
     lose_points: int = 0
+
+    # --- ELO ---
+    elo_base: float = 1500.0
+    home_adv: float = 65.0
+    k_base: float = 30.0
+    # Multiplicateur de K par tournament_category (1..7) ; *k_base ≈ 60/45/35/30/20/15/10.
+    # cat null (tournoi inconnu) -> dernier multiplicateur (really_minor).
+    k_mult_by_category: tuple[float, ...] = (2.0, 1.5, 1.17, 1.0, 0.67, 0.5, 0.33)
+    elo_scale: float = 400.0  # diviseur logistique de l'écart de rating
+    # Multiplicateur de buts (forme FIFA, constantes tunables) ; seuils de marge structurels.
+    gd_mult_small: float = 1.0       # marge ≤ 1
+    gd_mult_medium: float = 1.5      # marge = 2
+    gd_mult_intercept: float = 11.0  # marge ≥ 3 : (intercept + marge) / divisor
+    gd_mult_divisor: float = 8.0
+
+    # --- H2H (valeurs par défaut au cold start, aucune confrontation passée) ---
+    h2h_default_winrate: float = 0.5
+    h2h_default_draw_rate: float = 0.25
+    h2h_default_gd: float = 0.0
