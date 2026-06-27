@@ -24,6 +24,7 @@ from sklearn.metrics import accuracy_score, log_loss
 from training.backtest import make_backtest_split
 from training.config import FeatureConfig
 from training.features.team_form import _FEATURE_COLUMNS
+from training.proba import clip_renorm
 
 # Colonnes données au modèle, regroupées par famille de features. Ces groupes sont les leviers
 # de sélection de colonnes pour Optuna (toggles par groupe, cf. `training.tuning`).
@@ -110,10 +111,9 @@ def evaluate(
     proba = classifier.predict_proba(features)
     # TabPFN renvoie des probas float32 dont la somme par ligne dérive de 1 (moyenne d'ensemble) :
     # au-delà de la tolérance de sklearn (rtol=sqrt(eps)~3.4e-4 en float32), log_loss émettrait un
-    # warning et calculerait sur des probas non normalisées. On renormalise (le log-loss est défini
-    # sur des probas sommant à 1 ; l'argmax — donc l'accuracy — est inchangé).
-    row_sums = proba.sum(axis=1, keepdims=True)
-    proba = np.divide(proba, row_sums, out=np.full_like(proba, np.nan), where=row_sums != 0)
+    # warning et calculerait sur des probas non normalisées. `clip_renorm` les rend valides
+    # (somme 1, dans (0, 1)) ; l'argmax — donc l'accuracy — est inchangé.
+    proba = clip_renorm(proba)
     return {
         "accuracy": accuracy_score(truth, classifier.predict(features)),
         # labels=classes_ : aligne les colonnes de proba même si une classe manque au train

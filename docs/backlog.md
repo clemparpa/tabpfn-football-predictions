@@ -27,7 +27,54 @@ un tournoi neutre où `home_team`/`away_team` n'est qu'un ordre nominal.
 
 ## Ordre de priorité
 
-`S1` (fondation) → `S2` (prérequis technique) → `S3` / `S4` / `S5` (validés contre S1).
+`S0` (réorga + couture d'évaluation) → `S1` (backtest tournoi) → `S3` / `S4` / `S5` (validés contre S1).
+
+> **S2 est absorbée par S0.** Le « split features-sur-tout / filtre des lignes » n'est pas un chantier
+> séparé : c'est le cœur de la couture d'évaluation introduite en S0 (commit 2). On garde la trace de
+> S2 plus bas, marquée *fusionnée*.
+
+---
+
+## S0 — Réorganisation + couture d'évaluation (socle) 🧱
+
+**Objectif** : assainir les points d'entrée et introduire **une couture d'évaluation réutilisable**
+(`build features sur tout → filtre des lignes → frame de probas → score`) sur laquelle S1, le notebook
+et `submit.py` se branchent, au lieu de réimplémenter chacun le fenêtrage du backtest.
+
+**Contexte** : le cœur `training/` (data → features → backtest → model → tuning) est propre et testé.
+Le « pas carré » est aux **bords** : (a) deux pipelines pandas legacy ([predict.py](../predict.py),
+[baseline.py](../baseline.py)) qui dupliquent tout le feature engineering ; (b) le fenêtrage train/test
+réimplémenté à la main dans [submit.py](../submit.py#L168-L178) au lieu d'appeler `make_backtest_split` ;
+(c) le post-traitement des probas (clip/renorm/alignement classes) éparpillé entre `ensemble._clip_renorm`,
+`submit.py` et `model.evaluate`, plus le bricolage du notebook. Cette couture corrige aussi le **piège n°1**
+(features sur tout, filtre des lignes seulement).
+
+**Découpage en commits** (chacun : `uv run pytest` vert, **zéro appel API réel**) :
+
+- **C1 — `training/proba.py` (unifier le post-traitement).** Extraire `clip_renorm(proba, eps)` (et
+  l'alignement de colonnes sur `classes_`), aujourd'hui dupliqués dans `ensemble._clip_renorm`,
+  [submit.py:191-192](../submit.py#L191-L192) et la renorm de `model.evaluate`. Tous les appelants l'importent.
+  *Acceptation* : un seul point de vérité pour les probas ; tests existants inchangés et verts.
+- **C2 — `training/evaluation.py` (la couture = ex-S2).** `build_eval_frame(cfg, res=None)` (features sur
+  **tout**, une fois) ; `select_rows(wide, *, train_pred, test_pred)` (filtre **lignes**, pas features) ;
+  `predict_proba_frame(clf, test, feature_columns)` → DF (métadonnées + `p_*` alignées) ; `score(frame)`
+  (log-loss + accuracy). *Acceptation* : `tests/test_evaluation.py` prouve que filtrer les **lignes** ne
+  change PAS les valeurs de features (ELO d'un même match identique avec/sans filtre), contrairement au
+  filtre amont `categories=` (critère d'acceptation de l'ex-S2).
+- **C3 — `make_backtest_split` → wrapper.** Réécrit au-dessus de la couture, **signature conservée**
+  (rétro-compat des tests). Ajoute un chemin « filtre des lignes évaluées » distinct du `categories=` amont.
+  *Acceptation* : `tests/test_backtest.py` vert sans modification de comportement.
+- **C4 — Rebrancher les appelants.** `submit.py` (supprime le fenêtrage dupliqué), `model.run_backtest`,
+  et le notebook [error_analysis.py](../notebooks/error_analysis.py) (utilise `predict_proba_frame`).
+  *Acceptation* : `submit.py --no-backtest` produit le même schéma CSV ; `uvx marimo check` du notebook OK.
+- **C5 — Déplacements de fichiers.** `predict.py`/`baseline.py` → `legacy/` (+ `legacy/README.md` « réfs
+  historiques, non maintenues ») ; `tests/test_baseline.py` → `tests/legacy/` avec import corrigé ;
+  `submit.py`/`tune_ensemble.py` → `cli/`. Mettre à jour [README.md](../README.md) (`python predict.py`
+  → `python legacy/predict.py`), `mlflow-ui.sh` si besoin, et les liens de ce backlog. Nettoyer le dossier
+  vide `tests/backtest/`. *Acceptation* : `uv run pytest` vert depuis la racine, aucun import cassé.
+
+**On ne touche pas** : `features/`, `config.py`, `mlflow_io.py`, `ensemble.py` (logique métier) — seulement
+consommés. **Dépendances** : aucune ; prérequis de S1.
 
 ---
 
@@ -60,7 +107,11 @@ les probas comme dans le notebook ; ne lancer les fits qu'avec accord explicite)
 
 ---
 
-## S2 — Split « features sur tout / filtre des lignes » (prérequis) 
+## S2 — Split « features sur tout / filtre des lignes » (✅ fusionnée dans S0·C2)
+
+> **Fusionnée dans S0 (commit C2).** Conservée ci-dessous pour la traçabilité ; ne pas planifier
+> séparément. Le critère d'acceptation (filtrer les lignes ne change pas les features) est porté par
+> `tests/test_evaluation.py` de S0.
 
 **Objectif** : pouvoir restreindre les lignes train/test à un sous-ensemble de catégories **sans** fausser
 le calcul des features.

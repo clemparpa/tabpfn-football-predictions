@@ -23,17 +23,8 @@ from dataclasses import dataclass, field
 import numpy as np
 from sklearn.ensemble import HistGradientBoostingClassifier
 
+from training.proba import PROBA_EPS, align_proba, clip_renorm
 from training.tuning import build_tabpfn
-
-# Borne de sécurité pour les probas (rules.md §5 : strictement dans (0, 1)). Sert aussi de plancher
-# avant le `log` en combinaison géométrique pour éviter les `-inf`.
-PROBA_EPS = 1e-6
-
-
-def _clip_renorm(proba: np.ndarray, eps: float) -> np.ndarray:
-    """Clip dans `[eps, 1-eps]` puis renormalise chaque ligne à somme 1 (probas valides)."""
-    proba = np.clip(proba, eps, 1.0 - eps)
-    return proba / proba.sum(axis=1, keepdims=True)
 
 
 def combine_probas(
@@ -62,7 +53,7 @@ def combine_probas(
         mixed = np.exp(log_mix)
     else:
         raise ValueError(f"method inconnue : {method!r} (attendu 'arith' ou 'geom')")
-    return _clip_renorm(mixed, eps)
+    return clip_renorm(mixed, eps)
 
 
 def build_gbm(gbm_kwargs: dict, random_state: int) -> HistGradientBoostingClassifier:
@@ -117,9 +108,7 @@ class EnsembleClassifier:
 
     def _aligned_proba(self, estimator, X) -> np.ndarray:
         """Probas de `estimator` réordonnées sur `self.classes_` (robuste à un ordre différent)."""
-        proba = np.asarray(estimator.predict_proba(X), dtype=np.float64)
-        order = [list(estimator.classes_).index(c) for c in self.classes_]
-        return proba[:, order]
+        return align_proba(estimator.predict_proba(X), estimator.classes_, self.classes_)
 
     def predict_proba(self, X) -> np.ndarray:
         if self.classes_ is None:

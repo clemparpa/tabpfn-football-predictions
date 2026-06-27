@@ -44,6 +44,7 @@ from training.model import (
     evaluate,
     train_classifier,
 )
+from training.proba import clip_renorm
 
 RANDOM_STATE = 42
 
@@ -63,9 +64,6 @@ WINNING_CFG = FeatureConfig(
     elo_scale=442.50335890278603,
 )
 WINNING_TABPFN_KWARGS = dict(n_estimators=8)
-
-# Bornes de sécurité pour les probas (rules.md §5 : strictement dans (0, 1)).
-PROBA_EPS = 1e-6
 
 
 # --- Résolution de la config (MLflow ou constantes en dur) -------------------------------
@@ -188,8 +186,7 @@ def main() -> None:
     proba = clf.predict_proba(_feature_matrix(future, feature_columns))
 
     # Clip + renormalisation : garantit 0 < p < 1 et somme ≈ 1 (rules.md §5).
-    proba = np.clip(proba, PROBA_EPS, 1 - PROBA_EPS)
-    proba = proba / proba.sum(axis=1, keepdims=True)
+    proba = clip_renorm(proba)
     classes = list(clf.classes_)
     col = {c: proba[:, i] for i, c in enumerate(classes)}
     predicted = np.array(classes)[proba.argmax(axis=1)]
