@@ -108,6 +108,12 @@ def evaluate(
     features = _feature_matrix(test_df, feature_columns)
     truth = test_df.get_column("outcome").to_numpy()
     proba = classifier.predict_proba(features)
+    # TabPFN renvoie des probas float32 dont la somme par ligne dérive de 1 (moyenne d'ensemble) :
+    # au-delà de la tolérance de sklearn (rtol=sqrt(eps)~3.4e-4 en float32), log_loss émettrait un
+    # warning et calculerait sur des probas non normalisées. On renormalise (le log-loss est défini
+    # sur des probas sommant à 1 ; l'argmax — donc l'accuracy — est inchangé).
+    row_sums = proba.sum(axis=1, keepdims=True)
+    proba = np.divide(proba, row_sums, out=np.full_like(proba, np.nan), where=row_sums != 0)
     return {
         "accuracy": accuracy_score(truth, classifier.predict(features)),
         # labels=classes_ : aligne les colonnes de proba même si une classe manque au train

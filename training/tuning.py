@@ -164,6 +164,7 @@ def objective(
     lean: bool = True,
     classifier_factory=None,
     log_mlflow: bool = False,
+    experiment: str = OPTUNA_EXPERIMENT,
 ) -> float:
     """Évalue un trial en walk-forward et renvoie le log-loss moyen (à minimiser).
 
@@ -212,19 +213,19 @@ def objective(
     if log_mlflow:
         _log_trial_to_mlflow(
             trial, cfg, columns, tabpfn_kwargs, train_years, cutoffs,
-            losses, mean_loss, accuracies, mean_accuracy,
+            losses, mean_loss, accuracies, mean_accuracy, experiment,
         )
     return mean_loss
 
 
 def _log_trial_to_mlflow(
     trial, cfg: FeatureConfig, columns, tabpfn_kwargs, train_years, cutoffs,
-    losses, mean_loss, accuracies, mean_accuracy,
+    losses, mean_loss, accuracies, mean_accuracy, experiment,
 ) -> None:
     import mlflow
 
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-    mlflow.set_experiment(OPTUNA_EXPERIMENT)
+    mlflow.set_experiment(experiment)
     with mlflow.start_run(run_name=f"trial-{trial.number}"):
         params = {f"cfg.{k}": str(v) for k, v in asdict(cfg).items()}
         params.update({f"tabpfn.{k}": str(v) for k, v in tabpfn_kwargs.items()})
@@ -251,6 +252,7 @@ def run_study(
     categories=None,
     storage: str | None = OPTUNA_STORAGE,
     study_name: str = DEFAULT_STUDY_NAME,
+    experiment: str | None = None,
     include_thinking: bool = True,
     lean: bool = True,
     random_state: int = 42,
@@ -262,7 +264,11 @@ def run_study(
     `lean` (défaut) restreint l'espace de recherche (cf. `objective`). `classifier_factory` est
     passé à `objective` (défaut : `build_tabpfn`, appel réseau) — un faux classifieur permet un
     run hors-ligne.
+
+    `experiment` nomme l'expérience MLflow ; par défaut elle est **dérivée du `study_name`**
+    (`f"{study_name}-optuna"`) pour qu'une nouvelle étude ne soit pas écrasée dans le même bucket.
     """
+    experiment = experiment or f"{study_name}-optuna"
     study = optuna.create_study(
         study_name=study_name,
         storage=storage,
@@ -283,6 +289,7 @@ def run_study(
             lean=lean,
             log_mlflow=log_mlflow,
             classifier_factory=classifier_factory,
+            experiment=experiment,
         ),
         n_trials=n_trials,
     )
@@ -305,6 +312,10 @@ def main():
     )
     parser.add_argument("--max-train", type=int, default=DEFAULT_MAX_TRAIN)
     parser.add_argument("--study-name", default=DEFAULT_STUDY_NAME)
+    parser.add_argument(
+        "--experiment", default=None,
+        help="nom de l'expérience MLflow (défaut : <study-name>-optuna)",
+    )
     parser.add_argument("--storage", default=OPTUNA_STORAGE)
     parser.add_argument(
         "--full", action="store_true",
@@ -323,6 +334,7 @@ def main():
         cutoffs=cutoffs,
         max_train=args.max_train,
         study_name=args.study_name,
+        experiment=args.experiment,
         storage=args.storage,
         include_thinking=not args.no_thinking,
         lean=not args.full,

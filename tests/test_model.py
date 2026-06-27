@@ -4,6 +4,7 @@ On injecte un faux classifieur (sklearn `DummyClassifier` ou un espion) pour val
 l'orchestration sans appeler l'API TabPFN. L'intégration features/split est vérifiée sur les
 vraies données.
 """
+import warnings
 from datetime import date
 
 import numpy as np
@@ -126,6 +127,35 @@ def test_evaluate_handles_class_absent_from_test(make_res):
     assert metrics["accuracy"] == 1.0
     assert metrics["log_loss"] == pytest.approx(-np.log(0.7))  # -log(proba vraie classe)
     assert metrics["n_test"] == split.test.height
+
+
+def test_evaluate_renormalizes_unnormalized_proba(make_res):
+    # TabPFN renvoie des probas float32 dont la somme par ligne dérive de 1 (moyenne d'ensemble).
+    # `evaluate` doit renormaliser : pas de UserWarning sklearn, et log-loss sur probas normalisées.
+    res = make_res(
+        [
+            (date(2016, 1, 1), "A", "B", 2, 0),  # home_win (train)
+            (date(2020, 1, 1), "A", "B", 1, 0),  # home_win (test)
+        ]
+    )
+    split = make_backtest_split(date(2019, 1, 1), train_years=10, res=res)
+
+    class _UnnormSpy:
+        classes_ = np.array(["away_win", "draw", "home_win"])
+
+        def predict(self, X):
+            return np.array(["home_win"] * len(X))
+
+        def predict_proba(self, X):
+            # somme par ligne ~0.9994 : hors tolérance float32 de sklearn (rtol=sqrt(eps)~3.4e-4).
+            p = np.tile(np.array([0.1, 0.2, 0.7], dtype=np.float32), (len(X), 1))
+            return p * np.float32(0.9994)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)  # un warning sum-to-one ferait échouer le test
+        metrics = evaluate(_UnnormSpy(), split.test)
+    # log-loss identique à des probas exactement normalisées [0.1, 0.2, 0.7].
+    assert metrics["log_loss"] == pytest.approx(-np.log(0.7))
 
 
 # --- plafond d'entraînement -----------------------------------------------------
