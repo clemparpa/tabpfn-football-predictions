@@ -1,9 +1,14 @@
 """Backtest « tournoi » en CLI : log-loss par grand tournoi + moyenne LOTO.
 
-Évalue la config (MLflow ou constantes en dur, **même résolution que `cli.submit`**) sur de vrais
-matchs de tournoi (`training.tournament`) : pour chaque édition, train sur tout l'historique
-antérieur, test sur ses matchs, puis moyenne **leave-one-tournament-out**. C'est la métrique qui
-ressemble à la cible (CDM 2026, neutre) — à préférer au log-loss calendaire global pour arbitrer.
+Évalue une **config de tuning stage-1** (`training.tuning`) — `FeatureConfig` + colonnes de
+features + `tabpfn_kwargs` + `train_years` — sur de vrais matchs de tournoi (`training.tournament`) :
+pour chaque édition, train sur l'historique antérieur (borné par `train_years`), test sur ses
+matchs, puis moyenne **leave-one-tournament-out**. C'est la métrique qui ressemble à la cible
+(CDM 2026, neutre) — à préférer au log-loss calendaire global pour arbitrer.
+
+La config vient soit d'une **run MLflow de tuning** (`--experiment` / `--run-id`, reconstruite via
+`reconstruct_from_params` — pur stage-1, aucun ensemble), soit des **constantes en dur** `WINNING_*`.
+Le modèle entraîné est **TabPFN nu** (pas d'ensembling), exactement comme `tournament_objective`.
 
 ⚠️ **Coût API** : chaque tournoi = un fit TabPFN distant (sur quota). Deux garde-fous :
 
@@ -12,8 +17,8 @@ ressemble à la cible (CDM 2026, neutre) — à préférer au log-loss calendair
    parquet. Un re-run réutilise le cache et ne refait **aucun** fit (sauf `--refresh-cache`).
 
 Exemples (depuis la racine du repo) :
-    python -m cli.tournament_eval --dry-run                      # plumbing hors-ligne
-    python -m cli.tournament_eval --experiment lean-tune-optuna  # vrais fits (gated par le cache)
+    python -m cli.tournament_eval --dry-run                         # plumbing hors-ligne
+    python -m cli.tournament_eval --experiment tabpfn-football-optuna  # meilleure run de tuning
     python -m cli.tournament_eval --tournaments "FIFA World Cup:2018,UEFA Euro:2021"
 """
 import argparse
@@ -25,27 +30,49 @@ from pathlib import Path
 import polars as pl
 from sklearn.dummy import DummyClassifier
 
-from cli.submit import apply_tabpfn_overrides, resolve_config
-from training.ensemble import build_model
+from cli.submit import (
+    WINNING_CFG,
+    WINNING_COLUMNS,
+    WINNING_TABPFN_KWARGS,
+    WINNING_TRAIN_YEARS,
+    apply_tabpfn_overrides,
+)
 from training.evaluation import build_eval_frame, feature_matrix, predict_proba_frame, score
+from training.mlflow_io import load_run_params, reconstruct_from_params
 from training.model import DEFAULT_MAX_TRAIN, train_classifier
-from training.tournament import DEFAULT_TOURNAMENTS, parse_tournaments, tournament_split
+from training.tournament import DEFAULT_TOURNAMENTS, Tournament, parse_tournaments, tournament_split
+from training.tuning import build_tabpfn
 
 RANDOM_STATE = 42
 DEFAULT_CACHE_DIR = ".tournament_cache"
 
 
-def config_key(cfg, feature_columns, ensemble_cfg, max_train) -> str:
-    """Hash court et stable de la config — clé de cache (évite de mélanger deux configs)."""
+def resolve_stage1_config(args):
+    """Résout la config **stage-1** : `(cfg, feature_columns, tabpfn_kwargs, train_years, source)`.
+
+    Depuis une run MLflow de tuning (`--run-id`/`--experiment`, via `reconstruct_from_params` — pur
+    stage-1, aucun bloc `ensemble.*`) ou, à défaut, les constantes en dur `WINNING_*`.
+    """
+    if args.run_id or args.experiment:
+        params, run_id, log_loss = load_run_params(args.run_id, args.experiment)
+        cfg, columns, tabpfn_kwargs, train_years = reconstruct_from_params(params)
+        ll = f"{log_loss:.4f}" if log_loss is not None else "?"
+        source = f"MLflow run {run_id} (log_loss={ll})"
+    else:
+        cfg, columns, train_years = WINNING_CFG, WINNING_COLUMNS, WINNING_TRAIN_YEARS
+        tabpfn_kwargs = dict(WINNING_TABPFN_KWARGS)
+        source = "constantes en dur (WINNING_*)"
+    return cfg, columns, tabpfn_kwargs, train_years, source
+
+
+def config_key(cfg, feature_columns, tabpfn_kwargs, train_years, max_train) -> str:
+    """Hash court et stable de la config stage-1 — clé de cache (évite de mélanger deux configs)."""
     payload = json.dumps(
         {
             "cfg": asdict(cfg),
             "columns": list(feature_columns),
-            "tabpfn": ensemble_cfg.tabpfn_kwargs,
-            "use_gbm": ensemble_cfg.use_gbm,
-            "combine": ensemble_cfg.combine,
-            "weight": ensemble_cfg.weight,
-            "gbm": ensemble_cfg.gbm_kwargs,
+            "tabpfn": tabpfn_kwargs,
+            "train_years": train_years,
             "max_train": max_train,
         },
         sort_keys=True,
@@ -54,8 +81,8 @@ def config_key(cfg, feature_columns, ensemble_cfg, max_train) -> str:
     return hashlib.sha1(payload.encode()).hexdigest()[:10]
 
 
-def make_fit_fn(ensemble_cfg, *, dry_run: bool):
-    """Construit le `fit_fn` : faux classifieur local (`dry_run`) ou vrai TabPFN distant."""
+def make_fit_fn(tabpfn_kwargs, *, dry_run: bool):
+    """Construit le `fit_fn` : faux classifieur local (`dry_run`) ou TabPFN nu distant."""
     if dry_run:
         def fit(train, feature_columns):
             clf = DummyClassifier(strategy="prior")
@@ -64,19 +91,20 @@ def make_fit_fn(ensemble_cfg, *, dry_run: bool):
         return fit
 
     def fit(train, feature_columns):
-        clf = build_model(ensemble_cfg, RANDOM_STATE)
+        clf = build_tabpfn(tabpfn_kwargs, RANDOM_STATE)
         return train_classifier(train, clf, RANDOM_STATE, feature_columns)
     return fit
 
 
 def proba_frame_for(
-    tournament: Tournament, *, wide, fit_fn, feature_columns, max_train, cache_path: Path | None
+    tournament: Tournament, *, wide, fit_fn, feature_columns, train_years, max_train,
+    cache_path: Path | None,
 ) -> pl.DataFrame:
     """Renvoie la frame de probas du tournoi, depuis le cache si présent, sinon fit + écrit le cache."""
     if cache_path is not None and cache_path.exists():
         return pl.read_parquet(cache_path)
 
-    split = tournament_split(tournament, wide=wide)
+    split = tournament_split(tournament, wide=wide, train_years=train_years)
     train = split.train
     if max_train is not None and train.height > max_train:
         train = train.sort("date").tail(max_train)
@@ -91,8 +119,11 @@ def proba_frame_for(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--experiment", default=None, help="meilleure run (log-loss) de cet experiment MLflow")
-    parser.add_argument("--run-id", default=None, help="run MLflow précise (prioritaire sur --experiment)")
+    parser.add_argument(
+        "--experiment", default=None,
+        help="meilleure run (log-loss) de cet experiment MLflow de tuning (ex. tabpfn-football-optuna)",
+    )
+    parser.add_argument("--run-id", default=None, help="run MLflow de tuning précise (prioritaire sur --experiment)")
     parser.add_argument("--n-estimators", type=int, default=None, help="override n_estimators TabPFN")
     parser.add_argument(
         "--thinking", action=argparse.BooleanOptionalAction, default=None,
@@ -110,28 +141,25 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="faux classifieur local (zéro appel API)")
     args = parser.parse_args()
 
-    cfg, feature_columns, ensemble_cfg, _train_years, source = resolve_config(args)
-    ensemble_cfg.tabpfn_kwargs = apply_tabpfn_overrides(
-        ensemble_cfg.tabpfn_kwargs,
+    cfg, feature_columns, tabpfn_kwargs, train_years, source = resolve_stage1_config(args)
+    tabpfn_kwargs = apply_tabpfn_overrides(
+        tabpfn_kwargs,
         n_estimators=args.n_estimators,
         thinking=args.thinking,
         thinking_effort=args.thinking_effort,
     )
-    # Ensembling GBM désactivé : on se recentre sur TabPFN seul (la couche GBM n'apportait rien).
-    # On force TabPFN-only même si la run MLflow chargée portait un bloc `ensemble.*`.
-    ensemble_cfg.use_gbm = False
 
     mode = "DRY-RUN (faux classifieur, zéro API)" if args.dry_run else "fits TabPFN réels"
     print(f"Source des params : {source}")
-    print(f"Mode : {mode} | {len(feature_columns)} features | tabpfn={ensemble_cfg.tabpfn_kwargs}")
+    print(f"Mode : {mode} | train_years={train_years} | {len(feature_columns)} features | tabpfn={tabpfn_kwargs}")
     print(f"Tournois : {len(args.tournaments)} édition(s)\n")
 
-    fit_fn = make_fit_fn(ensemble_cfg, dry_run=args.dry_run)
+    fit_fn = make_fit_fn(tabpfn_kwargs, dry_run=args.dry_run)
     wide = build_eval_frame(cfg)
 
     # Le cache est désactivé en dry-run (probas factices) et par --no-cache.
     use_cache = not args.no_cache and not args.dry_run
-    key = config_key(cfg, feature_columns, ensemble_cfg, args.max_train)
+    key = config_key(cfg, feature_columns, tabpfn_kwargs, train_years, args.max_train)
     cache_root = Path(args.cache_dir) / key
 
     rows: list[dict] = []
@@ -144,7 +172,7 @@ def main() -> None:
         hit = cache_path is not None and cache_path.exists()  # cache présent AVANT l'appel
         frame = proba_frame_for(
             t, wide=wide, fit_fn=fit_fn, feature_columns=feature_columns,
-            max_train=args.max_train, cache_path=cache_path,
+            train_years=train_years, max_train=args.max_train, cache_path=cache_path,
         )
         metrics = score(frame)
         cached = "cache" if hit else "fit "

@@ -1,17 +1,16 @@
 """Recherche d'hyperparamètres Optuna pour le backtest TabPFN.
 
 On optimise le **log-loss multi-classe** (métrique du concours, *lower is better*) en faisant
-varier conjointement quatre leviers par trial :
+varier deux leviers par trial :
 
-1. les hyperparamètres de `FeatureConfig` (fenêtres de forme, ELO, cold-starts H2H) ;
-2. la profondeur d'historique d'entraînement `train_years` ;
-3. la sélection de colonnes données au modèle, par **groupe** (`FEATURE_GROUPS`) ;
-4. les hyperparamètres de `tabpfn_client.TabPFNClassifier` (standards + mode *thinking*).
+1. **tous** les hyperparamètres de `FeatureConfig` (fenêtres de forme, ELO complet, cold-starts) ;
+2. la profondeur d'historique d'entraînement `train_years`.
 
-Par défaut, on tourne en mode **lean** : TabPFN est figé (`LEAN_TABPFN_KWARGS`) et l'ELO est
-réduit à ses 3 params les plus influents, pour concentrer le budget d'appels sur les leviers à
-fort impact (colonnes, `train_years`, ELO de base) et converger vite. `--full` rouvre la
-recherche large (tout le bloc TabPFN + ELO/cold-starts) — à réserver au micro-tuning du gagnant.
+Deux choix volontairement **figés** (pas tirés) : on donne toujours **toutes** les colonnes au
+modèle (`FEATURE_COLUMNS`) et TabPFN est gelé sur `TABPFN_KWARGS` (`n_estimators=2`, pas de
+*thinking*). TabPFN est un modèle pré-entraîné robuste à ses hyperparamètres : les tuner coûte
+cher en latence/quota pour un gain marginal. Toute la recherche se concentre donc sur le
+*feature engineering* (poids ELO, fenêtres) — le levier à fort impact sur ce problème.
 
 Chaque trial est évalué en **walk-forward** : on moyenne le log-loss sur une liste de `cutoffs`
 configurables (1 cutoff = exploration rapide ; 3-5 = estimation plus robuste). Comme chaque
@@ -33,7 +32,7 @@ import optuna
 from training.config import FeatureConfig
 from training.model import (
     DEFAULT_MAX_TRAIN,
-    FEATURE_GROUPS,
+    FEATURE_COLUMNS,
     MLFLOW_TRACKING_URI,
     run_backtest,
     train_classifier,
@@ -43,7 +42,7 @@ from training.tournament import DEFAULT_TOURNAMENTS, evaluate_tournaments, parse
 OPTUNA_STORAGE = "sqlite:///optuna.db"
 DEFAULT_STUDY_NAME = "tabpfn-football"
 OPTUNA_EXPERIMENT = "tabpfn-football-optuna"  # expérience MLflow dédiée à la recherche
-TRAIN_YEARS_RANGE = (4, 10)
+TRAIN_YEARS_RANGE = (2, 10)
 
 # Dates de cutoff candidates (plus récente en tête) ; `default_cutoffs(n)` en prend les n
 # premières. Chaque cutoff masque tout match >= date et teste sur les matchs réellement joués.
@@ -51,15 +50,11 @@ DEFAULT_CUTOFF_POOL: tuple[date, ...] = (
     date(2025, 1, 1),
 )
 
-# Groupe(s) de secours si le tirage désactive toutes les familles (TabPFN exige >=1 feature).
-_FALLBACK_GROUPS: tuple[str, ...] = ("elo", "diffs")
-
-# Config TabPFN figée en mode lean (défaut). TabPFN est un modèle pré-entraîné, robuste à ses
-# hyperparamètres : les tuner coûte cher en latence/quota pour un gain marginal. On fige donc le
-# bloc et on concentre la recherche sur les leviers spécifiques au problème (colonnes, train_years,
-# ELO). `n_estimators=2` est le compromis latence/bruit ; le mettre à 1 accélère encore, l'augmenter
-# lisse un peu les probas. `--full` rouvre la recherche complète sur TabPFN/ELO.
-LEAN_TABPFN_KWARGS: dict = {"n_estimators": 2}
+# Config TabPFN **figée** (jamais tirée). TabPFN est un modèle pré-entraîné, robuste à ses
+# hyperparamètres : les tuner coûte cher en latence/quota pour un gain marginal. `n_estimators=2`
+# est le compromis latence/bruit (1 accélère, plus lisse un peu les probas) ; pas de mode
+# *thinking*. Toute la recherche porte sur `FeatureConfig` + `train_years`.
+TABPFN_KWARGS: dict = {"n_estimators": 2}
 
 
 def default_cutoffs(n: int) -> tuple[date, ...]:
@@ -71,76 +66,41 @@ def default_cutoffs(n: int) -> tuple[date, ...]:
 
 # --- Espace de recherche : un helper pur par levier (chacun prend un `trial`) -----------
 
-def suggest_feature_columns(trial) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Toggle on/off chaque groupe de `FEATURE_GROUPS`.
+def suggest_feature_config(trial) -> FeatureConfig:
+    """Suggère **tous** les champs réglables de `FeatureConfig` (le reste garde ses défauts).
 
-    Renvoie `(colonnes, groupes_actifs)`. Garantit au moins un groupe actif : si le tirage
-    désactive tout, on retombe sur `_FALLBACK_GROUPS` (TabPFN exige >=1 colonne).
+    Une fenêtre partagée pour toutes les histoires `team_form` (réduit la dimensionnalité), le bloc
+    ELO complet (`home_adv`/`k_base`/`elo_scale`/`elo_base` + tous les `gd_mult_*` + les 7
+    multiplicateurs `k_mult_by_category`), le barème de points (`victory`/`draw`/`lose`) et le
+    cold-start H2H de différence de buts (`h2h_default_gd`).
+
+    Note : `elo_base` (décalage commun à toutes les équipes) et l'échelle du barème de points sont
+    quasi sans effet après standardisation des features par TabPFN — surtout du budget de recherche.
     """
-    active = [g for g in FEATURE_GROUPS if trial.suggest_categorical(f"use_{g}", [True, False])]
-    if not active:
-        active = list(_FALLBACK_GROUPS)
-    columns = tuple(c for g in FEATURE_GROUPS if g in active for c in FEATURE_GROUPS[g])
-    return columns, tuple(active)
-
-
-def suggest_feature_config(trial, *, team_form_active: bool, lean: bool = True) -> FeatureConfig:
-    """Suggère un sous-ensemble curaté de champs `FeatureConfig` (le reste garde ses défauts).
-
-    Les tailles de fenêtres `team_form` ne sont tirées **que si** le groupe est actif (une
-    fenêtre partagée pour toutes les histoires, afin de réduire la dimensionnalité).
-
-    En mode `lean` (défaut) on ne tire que les 3 params ELO les plus influents (`home_adv`,
-    `k_base`, `elo_scale`) ; `gd_mult_*` et les cold-starts H2H restent à leurs défauts. Le mode
-    complet (`lean=False`) rouvre tout le bloc.
-    """
-    params: dict = {}
-    if team_form_active:
-        window = trial.suggest_int("history_size", 3, 15)
-        params.update(
-            points_history_size=window,
-            winrate_history_size=window,
-            drawrate_history_size=window,
-            scores_history_size=window,
-            goal_diff_history_size=window,
-        )
-    # ELO (les 3 leviers les plus influents, toujours tirés)
-    params.update(
+    window = trial.suggest_int("history_size", 3, 15)
+    k_mult = tuple(trial.suggest_float(f"k_mult_cat{i}", 0.1, 2.5) for i in range(1, 8))
+    return FeatureConfig(
+        points_history_size=window,
+        winrate_history_size=window,
+        drawrate_history_size=window,
+        scores_history_size=window,
+        goal_diff_history_size=window,
+        # ELO : leviers de base + échelle de départ
         home_adv=trial.suggest_float("home_adv", 0.0, 150.0),
         k_base=trial.suggest_float("k_base", 10.0, 60.0),
-        elo_scale=trial.suggest_float("elo_scale", 200.0, 600.0),
+        # elo_scale=trial.suggest_float("elo_scale", 200.0, 600.0),
+        # elo_base=trial.suggest_float("elo_base", 1000.0, 2000.0),
+        k_mult_by_category=k_mult,
+        # multiplicateurs de marge (buts) : tous les seuils
+        gd_mult_small=trial.suggest_float("gd_mult_small", 0.5, 1.5),
+        gd_mult_medium=trial.suggest_float("gd_mult_medium", 1.0, 2.5),
+        gd_mult_intercept=trial.suggest_float("gd_mult_intercept", 5.0, 15.0),
+        gd_mult_divisor=trial.suggest_float("gd_mult_divisor", 4.0, 12.0),
+        # barème de points (feature team_form) + cold-start H2H
+        victory_points=trial.suggest_int("victory_points", 1, 5),
+        draw_points=trial.suggest_int("draw_points", 0, 3),
+        lose_points=trial.suggest_int("lose_points", 0, 2),
     )
-    if not lean:
-        # ELO fin + cold-starts : seulement en recherche complète.
-        params.update(
-            gd_mult_medium=trial.suggest_float("gd_mult_medium", 1.0, 2.5),
-            gd_mult_divisor=trial.suggest_float("gd_mult_divisor", 4.0, 12.0),
-            default_points=trial.suggest_float("default_points", 0.5, 2.0),
-            h2h_default_winrate=trial.suggest_float("h2h_default_winrate", 0.3, 0.7),
-            h2h_default_draw_rate=trial.suggest_float("h2h_default_draw_rate", 0.1, 0.4),
-        )
-    return FeatureConfig(**params)
-
-
-def suggest_tabpfn_kwargs(trial, *, include_thinking: bool, lean: bool = True) -> dict:
-    """Suggère les kwargs passés à `TabPFNClassifier` (hors `random_state`/`ignore_*`).
-
-    En mode `lean` (défaut) TabPFN est **figé** (`LEAN_TABPFN_KWARGS`) : rien n'est tiré. Le mode
-    complet (`lean=False`) tire les params standards, et le bloc *thinking* si `include_thinking`
-    ET que le trial l'active.
-    """
-    if lean:
-        return dict(LEAN_TABPFN_KWARGS)
-    kwargs = dict(
-        n_estimators=trial.suggest_int("n_estimators", 1, 8),
-        softmax_temperature=trial.suggest_float("softmax_temperature", 0.5, 1.5),
-        balance_probabilities=trial.suggest_categorical("balance_probabilities", [True, False]),
-        average_before_softmax=trial.suggest_categorical("average_before_softmax", [True, False]),
-    )
-    if include_thinking and trial.suggest_categorical("thinking_mode", [True, False]):
-        kwargs["thinking_mode"] = True
-        kwargs["thinking_effort"] = trial.suggest_categorical("thinking_effort", ["medium", "high"])
-    return kwargs
 
 
 def build_tabpfn(kwargs: dict, random_state: int):
@@ -152,19 +112,16 @@ def build_tabpfn(kwargs: dict, random_state: int):
     )
 
 
-def suggest_trial_params(
-    trial, *, train_years_range: tuple[int, int], include_thinking: bool, lean: bool
-):
-    """Tire les leviers communs d'un trial : `(train_years, colonnes, FeatureConfig, tabpfn_kwargs)`.
+def suggest_trial_params(trial, *, train_years_range: tuple[int, int]):
+    """Tire les leviers d'un trial : `(train_years, colonnes, FeatureConfig, tabpfn_kwargs)`.
 
     Partagé par l'objectif calendaire (`objective`) et l'objectif tournoi (`tournament_objective`)
-    pour qu'ils explorent **le même espace** d'hyperparamètres.
+    pour qu'ils explorent **le même espace**. Les colonnes (toutes : `FEATURE_COLUMNS`) et les
+    kwargs TabPFN (`TABPFN_KWARGS`) sont **figés** — seuls `FeatureConfig` et `train_years` varient.
     """
     train_years = trial.suggest_int("train_years", *train_years_range)
-    columns, active_groups = suggest_feature_columns(trial)
-    cfg = suggest_feature_config(trial, team_form_active="team_form" in active_groups, lean=lean)
-    tabpfn_kwargs = suggest_tabpfn_kwargs(trial, include_thinking=include_thinking, lean=lean)
-    return train_years, columns, cfg, tabpfn_kwargs
+    cfg = suggest_feature_config(trial)
+    return train_years, FEATURE_COLUMNS, cfg, dict(TABPFN_KWARGS)
 
 
 # --- Objectif Optuna ---------------------------------------------------------------------
@@ -177,16 +134,14 @@ def objective(
     max_train: int | None = DEFAULT_MAX_TRAIN,
     categories=None,
     random_state: int = 42,
-    include_thinking: bool = True,
-    lean: bool = True,
     classifier_factory=None,
     log_mlflow: bool = False,
     experiment: str = OPTUNA_EXPERIMENT,
 ) -> float:
     """Évalue un trial en walk-forward et renvoie le log-loss moyen (à minimiser).
 
-    `lean` (défaut) restreint l'espace de recherche : ELO réduit à 3 params, TabPFN figé
-    (cf. `suggest_feature_config`/`suggest_tabpfn_kwargs`). `lean=False` rouvre la recherche large.
+    On tire tout `FeatureConfig` + `train_years` ; colonnes et TabPFN sont figés
+    (cf. `suggest_trial_params`).
 
     `classifier_factory(kwargs, random_state)` est injectable (défaut : `build_tabpfn`) — un faux
     classifieur permet de tester l'orchestration sans réseau. Une **instance fraîche par cutoff**
@@ -194,7 +149,7 @@ def objective(
     """
     factory = classifier_factory or build_tabpfn
     train_years, columns, cfg, tabpfn_kwargs = suggest_trial_params(
-        trial, train_years_range=train_years_range, include_thinking=include_thinking, lean=lean
+        trial, train_years_range=train_years_range
     )
 
     losses: list[float] = []
@@ -264,8 +219,6 @@ def tournament_objective(
     train_years_range: tuple[int, int] = TRAIN_YEARS_RANGE,
     max_train: int | None = DEFAULT_MAX_TRAIN,
     random_state: int = 42,
-    include_thinking: bool = True,
-    lean: bool = True,
     classifier_factory=None,
     log_mlflow: bool = False,
     experiment: str = OPTUNA_EXPERIMENT,
@@ -282,7 +235,7 @@ def tournament_objective(
     """
     factory = classifier_factory or build_tabpfn
     train_years, columns, cfg, tabpfn_kwargs = suggest_trial_params(
-        trial, train_years_range=train_years_range, include_thinking=include_thinking, lean=lean
+        trial, train_years_range=train_years_range
     )
 
     def fit_fn(train, feature_columns):
@@ -343,11 +296,10 @@ def run_study(
     storage: str | None = OPTUNA_STORAGE,
     study_name: str = DEFAULT_STUDY_NAME,
     experiment: str | None = None,
-    include_thinking: bool = True,
-    lean: bool = True,
     random_state: int = 42,
     log_mlflow: bool = True,
     classifier_factory=None,
+    n_jobs: int = 1,
 ):
     """Crée/charge l'étude (résumable) et lance `n_trials` essais d'optimisation.
 
@@ -355,11 +307,16 @@ def run_study(
     (`objective`) ; passer `tournaments` optimise le **log-loss LOTO tournoi** (`tournament_objective`,
     proche de la cible CDM). Exactement l'une des deux doit être fournie.
 
-    `lean` (défaut) restreint l'espace de recherche. `classifier_factory` est passé à l'objectif
-    (défaut : `build_tabpfn`, appel réseau) — un faux classifieur permet un run hors-ligne.
+    `classifier_factory` est passé à l'objectif (défaut : `build_tabpfn`, appel réseau) — un faux
+    classifieur permet un run hors-ligne.
 
     `experiment` nomme l'expérience MLflow ; par défaut elle est **dérivée du `study_name`**
     (`f"{study_name}-optuna"`) pour qu'une nouvelle étude ne soit pas écrasée dans le même bucket.
+
+    `n_jobs` parallélise les trials (threads). Comme un fit TabPFN est un appel réseau (I/O-bound),
+    le GIL se libère pendant l'attente → gain quasi linéaire. Le sampler TPE est configuré en
+    `constant_liar` (pénalise les trials en vol pour que les workers n'explorent pas la même région)
+    et `multivariate` (modélise les corrélations de l'espace ~21D) — adapté à cette concurrence.
     """
     if (cutoffs is None) == (tournaments is None):
         raise ValueError("Fournir exactement l'un de `cutoffs` (calendaire) ou `tournaments` (LOTO).")
@@ -368,7 +325,9 @@ def run_study(
         study_name=study_name,
         storage=storage,
         direction="minimize",
-        sampler=optuna.samplers.TPESampler(seed=random_state),
+        sampler=optuna.samplers.TPESampler(
+            seed=random_state, constant_liar=True, multivariate=True
+        ),
         pruner=optuna.pruners.MedianPruner(n_warmup_steps=1),
         load_if_exists=True,
     )
@@ -380,8 +339,6 @@ def run_study(
             train_years_range=train_years_range,
             max_train=max_train,
             random_state=random_state,
-            include_thinking=include_thinking,
-            lean=lean,
             log_mlflow=log_mlflow,
             classifier_factory=classifier_factory,
             experiment=experiment,
@@ -394,14 +351,12 @@ def run_study(
             max_train=max_train,
             categories=categories,
             random_state=random_state,
-            include_thinking=include_thinking,
-            lean=lean,
             log_mlflow=log_mlflow,
             classifier_factory=classifier_factory,
             experiment=experiment,
         )
 
-    study.optimize(target, n_trials=n_trials)
+    study.optimize(target, n_trials=n_trials, n_jobs=n_jobs)
     print(f"best log_loss = {study.best_value:.4f}")
     print(f"best params   = {study.best_params}")
     return study
@@ -414,6 +369,10 @@ def _parse_cutoffs(value: str) -> tuple[date, ...]:
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--n-trials", type=int, default=20)
+    parser.add_argument(
+        "--n-jobs", type=int, default=1,
+        help="trials en parallèle (threads ; fits TabPFN I/O-bound). Attention au quota/débit API.",
+    )
     parser.add_argument("--n-cutoffs", type=int, default=1, help="nb de cutoffs récents du pool")
     parser.add_argument(
         "--cutoffs", type=_parse_cutoffs, default=None,
@@ -434,14 +393,6 @@ def main():
         help="nom de l'expérience MLflow (défaut : <study-name>-optuna)",
     )
     parser.add_argument("--storage", default=OPTUNA_STORAGE)
-    parser.add_argument(
-        "--full", action="store_true",
-        help="recherche large : tous params ELO/cold-starts + TabPFN complet (défaut : lean)",
-    )
-    parser.add_argument(
-        "--no-thinking", action="store_true",
-        help="exclut le mode thinking (pertinent uniquement avec --full)",
-    )
     parser.add_argument("--no-mlflow", action="store_true", help="désactive le logging MLflow")
     args = parser.parse_args()
 
@@ -455,9 +406,8 @@ def main():
         study_name=args.study_name,
         experiment=args.experiment,
         storage=args.storage,
-        include_thinking=not args.no_thinking,
-        lean=not args.full,
         log_mlflow=not args.no_mlflow,
+        n_jobs=args.n_jobs,
     )
 
 
