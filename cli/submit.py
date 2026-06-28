@@ -130,8 +130,6 @@ def main() -> None:
         help="force le mode thinking : --thinking l'active, --no-thinking le désactive (défaut : valeur de la source)",
     )
     parser.add_argument("--thinking-effort", choices=["medium", "high"], default="medium", help="effort du mode thinking (si activé)")
-    parser.add_argument("--no-gbm", action="store_true", help="désactive la couche GBM (TabPFN seul) même si la run l'active")
-    parser.add_argument("--weight", type=float, default=None, help="override du poids TabPFN dans l'ensemble (0..1)")
     parser.add_argument("--out", default=None, help="chemin du CSV de sortie (défaut : predictions_YYYYMMDD.csv)")
     parser.add_argument("--no-backtest", action="store_true", help="saute le backtest de contrôle")
     args = parser.parse_args()
@@ -143,16 +141,12 @@ def main() -> None:
         thinking=args.thinking,
         thinking_effort=args.thinking_effort,
     )
-    if args.no_gbm:
-        ensemble_cfg.use_gbm = False
-    if args.weight is not None:
-        ensemble_cfg.weight = args.weight
+    # Ensembling GBM désactivé : recentrage sur TabPFN seul (la couche GBM n'apportait rien).
+    # On force TabPFN-only même si la run MLflow chargée portait un bloc `ensemble.*`.
+    ensemble_cfg.use_gbm = False
     print(f"Source des params : {source}")
     print(f"train_years={train_years} | {len(feature_columns)} features | tabpfn={ensemble_cfg.tabpfn_kwargs}")
-    if ensemble_cfg.use_gbm:
-        print(f"Ensemble : GBM activé (combine={ensemble_cfg.combine}, weight={ensemble_cfg.weight:.3f}, gbm={ensemble_cfg.gbm_kwargs})")
-    else:
-        print("Ensemble : TabPFN seul (GBM désactivé)")
+    print("Modèle : TabPFN seul (ensembling GBM désactivé)")
 
     res = load_matches()
     latest = res.filter(pl.col("finished")).get_column("date").max()

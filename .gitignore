@@ -7,3 +7,4 @@ __pycache__/
 .claude
 notebooks/__marimo__/
 notebooks/cache/
+.tournament_cache/
