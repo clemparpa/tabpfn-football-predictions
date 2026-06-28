@@ -60,6 +60,21 @@ COPA_AMERICAS: tuple[Tournament, ...] = tuple(Tournament("Copa América", y) for
 DEFAULT_TOURNAMENTS: tuple[Tournament, ...] = WORLD_CUPS + EUROS + COPA_AMERICAS
 
 
+def parse_tournaments(value: str) -> tuple[Tournament, ...]:
+    """Parse `"FIFA World Cup:2018,UEFA Euro:2021"` → tuple de `Tournament` (nom:année).
+
+    Lève `ValueError` sur un item mal formé (compatible `argparse type=`). `rpartition(":")`
+    isole l'année finale, le nom pouvant contenir des espaces.
+    """
+    out: list[Tournament] = []
+    for item in value.split(","):
+        name, _, year = item.strip().rpartition(":")
+        if not name or not year.isdigit():
+            raise ValueError(f"Tournoi mal formé : {item!r} (attendu 'Nom:Année').")
+        out.append(Tournament(name.strip(), int(year)))
+    return tuple(out)
+
+
 @dataclass(frozen=True)
 class TournamentSplit:
     """Découpage train/test pour une édition : `cutoff` = veille du 1er match du tournoi."""
@@ -131,6 +146,7 @@ def evaluate_tournaments(
     cfg: FeatureConfig = FeatureConfig(),
     res: pl.DataFrame | None = None,
     max_train: int | None = DEFAULT_MAX_TRAIN,
+    train_years: int | None = None,
 ) -> TournamentReport:
     """Backtest LOTO : un fit par tournoi, log-loss/accuracy par édition + moyenne.
 
@@ -140,6 +156,7 @@ def evaluate_tournaments(
     tournoi, sur quota) — à ne lancer qu'avec accord explicite.
 
     `max_train` plafonne l'entraînement aux lignes les plus récentes (limite de l'API TabPFN).
+    `train_years` borne optionnellement l'historique d'entraînement (défaut : tout l'historique).
     """
     fit = fit_fn or _default_fit
     columns = tuple(feature_columns)
@@ -147,7 +164,7 @@ def evaluate_tournaments(
 
     per_tournament: list[dict] = []
     for t in tournaments:
-        split = tournament_split(t, wide=wide)
+        split = tournament_split(t, wide=wide, train_years=train_years)
         train = split.train
         if max_train is not None and train.height > max_train:
             train = train.sort("date").tail(max_train)

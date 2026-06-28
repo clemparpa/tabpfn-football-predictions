@@ -29,21 +29,10 @@ from cli.submit import apply_tabpfn_overrides, resolve_config
 from training.ensemble import build_model
 from training.evaluation import build_eval_frame, feature_matrix, predict_proba_frame, score
 from training.model import DEFAULT_MAX_TRAIN, train_classifier
-from training.tournament import DEFAULT_TOURNAMENTS, Tournament, tournament_split
+from training.tournament import DEFAULT_TOURNAMENTS, parse_tournaments, tournament_split
 
 RANDOM_STATE = 42
 DEFAULT_CACHE_DIR = ".tournament_cache"
-
-
-def parse_tournaments(value: str) -> tuple[Tournament, ...]:
-    """Parse `"FIFA World Cup:2018,UEFA Euro:2021"` → tuple de `Tournament` (nom:année)."""
-    out: list[Tournament] = []
-    for item in value.split(","):
-        name, _, year = item.strip().rpartition(":")  # rpartition : le nom peut contenir des espaces
-        if not name or not year.isdigit():
-            raise argparse.ArgumentTypeError(f"Tournoi mal formé : {item!r} (attendu 'Nom:Année').")
-        out.append(Tournament(name.strip(), int(year)))
-    return tuple(out)
 
 
 def config_key(cfg, feature_columns, ensemble_cfg, max_train) -> str:

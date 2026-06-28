@@ -36,7 +36,9 @@ from training.model import (
     FEATURE_GROUPS,
     MLFLOW_TRACKING_URI,
     run_backtest,
+    train_classifier,
 )
+from training.tournament import DEFAULT_TOURNAMENTS, evaluate_tournaments, parse_tournaments
 
 OPTUNA_STORAGE = "sqlite:///optuna.db"
 DEFAULT_STUDY_NAME = "tabpfn-football"
@@ -150,6 +152,21 @@ def build_tabpfn(kwargs: dict, random_state: int):
     )
 
 
+def suggest_trial_params(
+    trial, *, train_years_range: tuple[int, int], include_thinking: bool, lean: bool
+):
+    """Tire les leviers communs d'un trial : `(train_years, colonnes, FeatureConfig, tabpfn_kwargs)`.
+
+    Partagé par l'objectif calendaire (`objective`) et l'objectif tournoi (`tournament_objective`)
+    pour qu'ils explorent **le même espace** d'hyperparamètres.
+    """
+    train_years = trial.suggest_int("train_years", *train_years_range)
+    columns, active_groups = suggest_feature_columns(trial)
+    cfg = suggest_feature_config(trial, team_form_active="team_form" in active_groups, lean=lean)
+    tabpfn_kwargs = suggest_tabpfn_kwargs(trial, include_thinking=include_thinking, lean=lean)
+    return train_years, columns, cfg, tabpfn_kwargs
+
+
 # --- Objectif Optuna ---------------------------------------------------------------------
 
 def objective(
@@ -176,12 +193,9 @@ def objective(
     garantit un refit propre.
     """
     factory = classifier_factory or build_tabpfn
-    train_years = trial.suggest_int("train_years", *train_years_range)
-    columns, active_groups = suggest_feature_columns(trial)
-    cfg = suggest_feature_config(
-        trial, team_form_active="team_form" in active_groups, lean=lean
+    train_years, columns, cfg, tabpfn_kwargs = suggest_trial_params(
+        trial, train_years_range=train_years_range, include_thinking=include_thinking, lean=lean
     )
-    tabpfn_kwargs = suggest_tabpfn_kwargs(trial, include_thinking=include_thinking, lean=lean)
 
     losses: list[float] = []
     accuracies: list[float] = []
@@ -243,10 +257,86 @@ def _log_trial_to_mlflow(
             mlflow.log_metric("accuracy_per_cutoff", acc, step=i)
 
 
+def tournament_objective(
+    trial,
+    *,
+    tournaments=DEFAULT_TOURNAMENTS,
+    train_years_range: tuple[int, int] = TRAIN_YEARS_RANGE,
+    max_train: int | None = DEFAULT_MAX_TRAIN,
+    random_state: int = 42,
+    include_thinking: bool = True,
+    lean: bool = True,
+    classifier_factory=None,
+    log_mlflow: bool = False,
+    experiment: str = OPTUNA_EXPERIMENT,
+) -> float:
+    """Évalue un trial sur le **backtest tournoi** et renvoie le log-loss LOTO (à minimiser).
+
+    Même espace de recherche que `objective` (via `suggest_trial_params`) mais la métrique est la
+    moyenne leave-one-tournament-out de `training.tournament.evaluate_tournaments` — proche de la
+    cible (CDM 2026, neutre) plutôt que du log-loss calendaire global.
+
+    `train_years` (tiré par le trial) borne l'historique d'entraînement de chaque tournoi.
+    `classifier_factory(kwargs, random_state)` est injectable (défaut : `build_tabpfn`) — un faux
+    classifieur teste l'orchestration sans réseau. Chaque tournoi = un fit (cf. `evaluate_tournaments`).
+    """
+    factory = classifier_factory or build_tabpfn
+    train_years, columns, cfg, tabpfn_kwargs = suggest_trial_params(
+        trial, train_years_range=train_years_range, include_thinking=include_thinking, lean=lean
+    )
+
+    def fit_fn(train, feature_columns):
+        return train_classifier(train, factory(tabpfn_kwargs, random_state), random_state, feature_columns)
+
+    report = evaluate_tournaments(
+        tournaments,
+        fit_fn=fit_fn,
+        feature_columns=columns,
+        cfg=cfg,
+        max_train=max_train,
+        train_years=train_years,
+    )
+    trial.set_user_attr("accuracy", report.loto_accuracy)
+    trial.set_user_attr(
+        "per_tournament",
+        str([(r["tournament"], round(r["log_loss"], 4)) for r in report.per_tournament]),
+    )
+    if log_mlflow:
+        _log_tournament_trial_to_mlflow(
+            trial, cfg, columns, tabpfn_kwargs, train_years, report, experiment
+        )
+    return report.loto_log_loss
+
+
+def _log_tournament_trial_to_mlflow(
+    trial, cfg: FeatureConfig, columns, tabpfn_kwargs, train_years, report, experiment,
+) -> None:
+    import mlflow
+
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    mlflow.set_experiment(experiment)
+    with mlflow.start_run(run_name=f"trial-{trial.number}"):
+        params = {f"cfg.{k}": str(v) for k, v in asdict(cfg).items()}
+        params.update({f"tabpfn.{k}": str(v) for k, v in tabpfn_kwargs.items()})
+        params.update(
+            train_years=train_years,
+            n_features=len(columns),
+            n_tournaments=len(report.per_tournament),
+            feature_columns=str(list(columns)),
+        )
+        mlflow.log_params(params)
+        mlflow.log_metric("log_loss", report.loto_log_loss)  # = log-loss LOTO
+        mlflow.log_metric("accuracy", report.loto_accuracy)
+        for i, r in enumerate(report.per_tournament):
+            mlflow.log_metric("log_loss_per_tournament", r["log_loss"], step=i)
+            mlflow.log_metric("accuracy_per_tournament", r["accuracy"], step=i)
+
+
 def run_study(
     *,
     n_trials: int,
-    cutoffs,
+    cutoffs=None,
+    tournaments=None,
     train_years_range: tuple[int, int] = TRAIN_YEARS_RANGE,
     max_train: int | None = DEFAULT_MAX_TRAIN,
     categories=None,
@@ -261,13 +351,18 @@ def run_study(
 ):
     """Crée/charge l'étude (résumable) et lance `n_trials` essais d'optimisation.
 
-    `lean` (défaut) restreint l'espace de recherche (cf. `objective`). `classifier_factory` est
-    passé à `objective` (défaut : `build_tabpfn`, appel réseau) — un faux classifieur permet un
-    run hors-ligne.
+    Deux métriques mutuellement exclusives : passer `cutoffs` optimise le **log-loss calendaire**
+    (`objective`) ; passer `tournaments` optimise le **log-loss LOTO tournoi** (`tournament_objective`,
+    proche de la cible CDM). Exactement l'une des deux doit être fournie.
+
+    `lean` (défaut) restreint l'espace de recherche. `classifier_factory` est passé à l'objectif
+    (défaut : `build_tabpfn`, appel réseau) — un faux classifieur permet un run hors-ligne.
 
     `experiment` nomme l'expérience MLflow ; par défaut elle est **dérivée du `study_name`**
     (`f"{study_name}-optuna"`) pour qu'une nouvelle étude ne soit pas écrasée dans le même bucket.
     """
+    if (cutoffs is None) == (tournaments is None):
+        raise ValueError("Fournir exactement l'un de `cutoffs` (calendaire) ou `tournaments` (LOTO).")
     experiment = experiment or f"{study_name}-optuna"
     study = optuna.create_study(
         study_name=study_name,
@@ -277,8 +372,22 @@ def run_study(
         pruner=optuna.pruners.MedianPruner(n_warmup_steps=1),
         load_if_exists=True,
     )
-    study.optimize(
-        lambda trial: objective(
+
+    if tournaments is not None:
+        target = lambda trial: tournament_objective(
+            trial,
+            tournaments=tournaments,
+            train_years_range=train_years_range,
+            max_train=max_train,
+            random_state=random_state,
+            include_thinking=include_thinking,
+            lean=lean,
+            log_mlflow=log_mlflow,
+            classifier_factory=classifier_factory,
+            experiment=experiment,
+        )
+    else:
+        target = lambda trial: objective(
             trial,
             cutoffs=cutoffs,
             train_years_range=train_years_range,
@@ -290,9 +399,9 @@ def run_study(
             log_mlflow=log_mlflow,
             classifier_factory=classifier_factory,
             experiment=experiment,
-        ),
-        n_trials=n_trials,
-    )
+        )
+
+    study.optimize(target, n_trials=n_trials)
     print(f"best log_loss = {study.best_value:.4f}")
     print(f"best params   = {study.best_params}")
     return study
@@ -309,6 +418,14 @@ def main():
     parser.add_argument(
         "--cutoffs", type=_parse_cutoffs, default=None,
         help="liste explicite, ex. 2024-01-01,2025-01-01 (prioritaire sur --n-cutoffs)",
+    )
+    parser.add_argument(
+        "--tournament", action="store_true",
+        help="optimise le log-loss LOTO tournoi (CDM+Euro+Copa) au lieu du calendaire",
+    )
+    parser.add_argument(
+        "--tournaments", type=parse_tournaments, default=None,
+        help="liste 'Nom:Année,...' à optimiser (implique --tournament ; défaut : pool complet)",
     )
     parser.add_argument("--max-train", type=int, default=DEFAULT_MAX_TRAIN)
     parser.add_argument("--study-name", default=DEFAULT_STUDY_NAME)
@@ -328,10 +445,12 @@ def main():
     parser.add_argument("--no-mlflow", action="store_true", help="désactive le logging MLflow")
     args = parser.parse_args()
 
-    cutoffs = args.cutoffs or default_cutoffs(args.n_cutoffs)
+    # Métrique calendaire (défaut) ou LOTO tournoi (--tournament / --tournaments).
+    tournament_mode = args.tournament or args.tournaments is not None
     run_study(
         n_trials=args.n_trials,
-        cutoffs=cutoffs,
+        cutoffs=None if tournament_mode else (args.cutoffs or default_cutoffs(args.n_cutoffs)),
+        tournaments=(args.tournaments or DEFAULT_TOURNAMENTS) if tournament_mode else None,
         max_train=args.max_train,
         study_name=args.study_name,
         experiment=args.experiment,

@@ -13,15 +13,18 @@ from sklearn.dummy import DummyClassifier
 
 from training.config import FeatureConfig
 from training.model import FEATURE_COLUMNS, FEATURE_GROUPS
+from training.tournament import Tournament
 from training.tuning import (
     _FALLBACK_GROUPS,
     DEFAULT_CUTOFF_POOL,
     LEAN_TABPFN_KWARGS,
     default_cutoffs,
     objective,
+    run_study,
     suggest_feature_columns,
     suggest_feature_config,
     suggest_tabpfn_kwargs,
+    tournament_objective,
 )
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -176,3 +179,42 @@ def test_default_cutoffs_bounds():
         default_cutoffs(0)
     with pytest.raises(ValueError):
         default_cutoffs(pool_size + 1)  # au-delà du pool
+
+
+def test_tournament_objective_optimizes_loto_offline():
+    """`tournament_objective` renvoie le log-loss LOTO, un fit par tournoi, sans réseau."""
+    pool = (Tournament("FIFA World Cup", 2014), Tournament("FIFA World Cup", 2018))
+    calls: list[int] = []
+
+    def fake_factory(kwargs, random_state):
+        calls.append(1)
+        return DummyClassifier(strategy="prior")
+
+    study = optuna.create_study(direction="minimize")
+    study.optimize(
+        lambda trial: tournament_objective(
+            trial,
+            tournaments=pool,
+            train_years_range=(8, 8),  # déterministe
+            classifier_factory=fake_factory,
+            log_mlflow=False,
+        ),
+        n_trials=1,
+    )
+
+    assert len(calls) == len(pool)  # un fit par tournoi
+    assert np.isfinite(study.best_value) and study.best_value > 0
+    assert 0.0 <= study.best_trial.user_attrs["accuracy"] <= 1.0
+    assert "FIFA World Cup 2018" in study.best_trial.user_attrs["per_tournament"]
+
+
+def test_run_study_requires_exactly_one_metric():
+    """`run_study` exige soit `cutoffs`, soit `tournaments` — pas les deux, pas aucun."""
+    with pytest.raises(ValueError, match="exactement l'un"):
+        run_study(n_trials=1, storage=None, log_mlflow=False)  # aucun
+    with pytest.raises(ValueError, match="exactement l'un"):
+        run_study(
+            n_trials=1, cutoffs=(date(2018, 1, 1),),
+            tournaments=(Tournament("FIFA World Cup", 2018),),
+            storage=None, log_mlflow=False,
+        )  # les deux
