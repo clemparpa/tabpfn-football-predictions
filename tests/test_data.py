@@ -19,7 +19,7 @@ def test_load_matches_columns(real_matches):
         "tournament_category", "tournament_category_label",
     }
     assert expected.issubset(set(real_matches.columns))
-    assert "tournament" not in real_matches.columns  # droppée après le join
+    assert "tournament" in real_matches.columns  # conservée (cible du backtest tournoi)
     assert real_matches.schema["date"] == pl.Date
 
 

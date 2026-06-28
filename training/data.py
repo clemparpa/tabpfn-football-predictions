@@ -61,7 +61,10 @@ def load_tournament_importance() -> pl.DataFrame:
 def load_matches() -> pl.DataFrame:
     """Charge les résultats locaux, ajoute `finished`, l'importance du tournoi et `match_id`.
 
-    Garde `neutral` intact (servira à l'ELO). Les matchs non joués restent présents.
+    Garde `neutral` intact (servira à l'ELO) et conserve le nom du `tournament` (utilisé par le
+    backtest tournoi de `training.tournament` pour cibler une édition précise — ex. CDM 2018). La
+    colonne traverse `build_features` sans effet : ni `feature_matrix` ni `predict_proba_frame` ne
+    la lisent. Les matchs non joués restent présents.
     """
     return (
         pl.read_csv(RESULTS_PATH, null_values=["NA"])
@@ -71,6 +74,5 @@ def load_matches() -> pl.DataFrame:
             pl.col("date").str.to_date(),
         )
         .join(load_tournament_importance(), how="left", on="tournament")
-        .drop("tournament")
         .with_row_index("match_id")
     )
